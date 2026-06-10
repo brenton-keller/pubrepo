@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pubrepo"
+dynamic = ["version"]
+description = "Publish a curated, scrubbed subset of a private repo to a clean public repo. The scrub gate makes leaking physically impossible."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Brenton James Keller" }]
+keywords = ["git", "publish", "scrub", "secrets", "mirror", "monorepo"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/brenton-keller/pubrepo"
+Changelog = "https://github.com/brenton-keller/pubrepo/blob/main/CHANGELOG.md"
+Issues = "https://github.com/brenton-keller/pubrepo/issues"
+
+[project.scripts]
+pubrepo = "pubrepo:main"
+
+[tool.setuptools]
+py-modules = ["pubrepo"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pubrepo.__version__" }
