@@ -52,20 +52,21 @@ def test_not_initialized_says_what_to_do(source_repo, public_remote, run):
     assert "init" in r.stderr
 
 
-@pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason="macOS CI runners inject git identity via mechanisms that "
-           "cannot be suppressed from within a test (Keychain, includeIf)")
 def test_identity_less_commit_gives_exact_commands(source_repo, public_remote, run, monkeypatch):
     repo = _repo(source_repo, public_remote)
     run(["init"], cwd=repo)
+    publish_dir = repo / ".publish"
+    # Block every identity source: env vars (levels 1+5), global/system
+    # config (levels 2-4), AND the getpwuid() OS fallback (level 6).
+    # user.useConfigOnly (Git 2.8+) makes git error instead of guessing
+    # from getpwuid() — the only reliable approach on macOS CI runners.
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     for v in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
               "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
         monkeypatch.delenv(v, raising=False)
-    publish_dir = repo / ".publish"
+    subprocess.run(["git", "config", "user.useConfigOnly", "true"], cwd=publish_dir, check=True)
     subprocess.run(["git", "config", "--unset", "user.name"], cwd=publish_dir, capture_output=True)
     subprocess.run(["git", "config", "--unset", "user.email"], cwd=publish_dir, capture_output=True)
     r = run([], cwd=repo)
