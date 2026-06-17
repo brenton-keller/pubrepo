@@ -54,23 +54,29 @@ def test_not_initialized_says_what_to_do(source_repo, public_remote, run):
 def test_identity_less_commit_gives_exact_commands(source_repo, public_remote, run, monkeypatch, tmp_path):
     repo = _repo(source_repo, public_remote)
     run(["init"], cwd=repo)
-    # Nuke every git identity source: env vars, global/system config,
-    # local config, and HOME itself (macOS CI runners have ~/.gitconfig
-    # set by actions/checkout that survives GIT_CONFIG_GLOBAL=/dev/null).
+    publish_dir = repo / ".publish"
+    # Erase identity everywhere git could find it: env, global, system,
+    # local repo config, HOME, and XDG.  macOS CI runners inject identity
+    # via actions/checkout's includeIf.gitdir — overriding HOME is not
+    # enough; we must also blank the repo-local config.
     fake_home = tmp_path / "empty_home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
-    monkeypatch.delenv("GIT_AUTHOR_EMAIL", raising=False)
-    monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
-    monkeypatch.delenv("GIT_COMMITTER_EMAIL", raising=False)
-    monkeypatch.delenv("EMAIL", raising=False)
-    publish_dir = repo / ".publish"
-    subprocess.run(["git", "config", "--unset", "user.name"], cwd=publish_dir, capture_output=True)
-    subprocess.run(["git", "config", "--unset", "user.email"], cwd=publish_dir, capture_output=True)
+    for v in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+              "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(v, raising=False)
+    # Strip identity from .publish repo-local config while preserving
+    # remote/branch — actions/checkout writes identity + includeIf here
+    # and env overrides alone don't suppress includeIf-sourced identity.
+    cfg = publish_dir / ".git" / "config"
+    lines = cfg.read_text().splitlines(keepends=True)
+    cleaned = [l for l in lines
+               if not any(k in l.lower() for k in ("user.name", "user.email", "includeif"))]
+    cfg.write_text("".join(cleaned))
     r = run([], cwd=repo)
     assert r.code == 2
     assert "git -C .publish config user.name" in r.stderr
