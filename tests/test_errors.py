@@ -51,15 +51,23 @@ def test_not_initialized_says_what_to_do(source_repo, public_remote, run):
     assert "init" in r.stderr
 
 
-def test_identity_less_commit_gives_exact_commands(source_repo, public_remote, run, monkeypatch):
+def test_identity_less_commit_gives_exact_commands(source_repo, public_remote, run, monkeypatch, tmp_path):
     repo = _repo(source_repo, public_remote)
     run(["init"], cwd=repo)
+    # Nuke every git identity source: env vars, global/system config,
+    # local config, and HOME itself (macOS CI runners have ~/.gitconfig
+    # set by actions/checkout that survives GIT_CONFIG_GLOBAL=/dev/null).
+    fake_home = tmp_path / "empty_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
     monkeypatch.delenv("GIT_AUTHOR_EMAIL", raising=False)
     monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
     monkeypatch.delenv("GIT_COMMITTER_EMAIL", raising=False)
+    monkeypatch.delenv("EMAIL", raising=False)
     publish_dir = repo / ".publish"
     subprocess.run(["git", "config", "--unset", "user.name"], cwd=publish_dir, capture_output=True)
     subprocess.run(["git", "config", "--unset", "user.email"], cwd=publish_dir, capture_output=True)
