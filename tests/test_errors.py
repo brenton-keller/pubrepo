@@ -1,6 +1,8 @@
 """T22: golden-phrase tests for the top error paths (phrases, not whole
 strings — refactor-tolerant) + the generic last-resort catch. T21's phase
 progress lines are pinned here too."""
+import subprocess
+
 import pytest
 
 import pubrepo
@@ -54,6 +56,13 @@ def test_identity_less_commit_gives_exact_commands(source_repo, public_remote, r
     run(["init"], cwd=repo)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("GIT_AUTHOR_EMAIL", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_EMAIL", raising=False)
+    publish_dir = repo / ".publish"
+    subprocess.run(["git", "config", "--unset", "user.name"], cwd=publish_dir, capture_output=True)
+    subprocess.run(["git", "config", "--unset", "user.email"], cwd=publish_dir, capture_output=True)
     r = run([], cwd=repo)
     assert r.code == 2
     assert "git -C .publish config user.name" in r.stderr
