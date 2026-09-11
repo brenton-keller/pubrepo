@@ -47,6 +47,7 @@ forbidden = ["acme-internal", "10.1.2."]
 ```bash
 pubrepo init       # clone the public remote into .publish/
 pubrepo --diff     # preview exactly what the world will receive
+pubrepo --stage    # rebuild .publish/ on disk for hands-on inspection
 pubrepo            # fetch-check, rebuild, transform, scrub, commit, push
 ```
 
@@ -144,6 +145,83 @@ well-defined preimage in your source. So:
   silently destroyed. On a non-diverged remote it degrades to a normal push.
 - Recommended: enable branch protection on the public repo (PRs only).
 
+## Re-publishing
+
+By default every publish appends a new snapshot commit. Two modes change
+that:
+
+| Mode | Flag | When to use | Push |
+|---|---|---|---|
+| new snapshot (default) | *(none)* | normal publishing | fast-forward |
+| amend | `--amend` | fix a just-published mistake | `--force-with-lease` (always) |
+| overwrite | `--force-overwrite` | reassert the mirror over foreign commits | `--force-with-lease` (when diverged) |
+
+`--amend` replaces your last published commit. The full rebuild runs
+normally; only the commit and push differ. Without `-m`, the existing
+commit title is reused and the trailer (`Source:`, `Files:`, …) is
+regenerated to reflect the new content. With `-m`, the title is replaced.
+Author identity is preserved; author and committer dates are refreshed.
+
+```bash
+pubrepo --amend               # rebuild, replace your last commit, push
+pubrepo --amend -m "fix typo" # same, with a new commit title
+```
+
+`--amend` **refuses foreign commits** — if the remote has moved (exit 5),
+run `--force-overwrite` first (new snapshot), then `--amend` for later
+fix-ups. `--amend --force-overwrite` is rejected (exit 1, conflicting
+intent). When there is no prior commit to amend (first publish, unborn
+HEAD), CLI `--amend` refuses (exit 2); a config default of
+`on_republish = "amend"` falls back to a new commit automatically.
+
+**Force-push permission required.** An amend is non-fast-forward by
+construction — `--amend` needs force-push permission on the published
+branch. If branch protection blocks it, the amend fails (exit 2) with a
+hint to use `--no-amend`.
+
+**Config default:** `on_republish = "amend"` in `.publish.toml` makes
+amend the project default. `--amend` forces amend; `--no-amend` forces
+a new commit. See [docs/config.md](docs/config.md).
+
+**Recovery.** If the amend push fails, the local commit is rolled back
+to the pre-amend state automatically. If an interrupt landed after the
+push completed but before the log was written, the next `--amend` refuses
+with a recovery hint — a normal publish works and restores consistency.
+
+## Staging
+
+`--stage` performs the full nuke-and-rebuild cycle — delete, copy,
+transform, scrub — then reports what changed and stops. No commit, no
+push, no publish log entry, no tags. The rebuilt files stay on disk in
+the publish directory for hands-on inspection. The publish clone's real
+git index is untouched (the change report uses a temporary index that is
+cleaned up); on interrupt, the existing handler resets the working tree
+and index to HEAD.
+
+```bash
+pubrepo --stage                            # rebuild and report
+pubrepo --stage --json                     # machine-readable change report
+git -C .publish status --short             # inspect the rebuilt tree yourself
+```
+
+Changes are diffed against the local publish-directory HEAD — the remote
+is never contacted. On an unborn HEAD (first stage after `init`), every
+file is reported as Added. Per-file statuses: `A` added, `M` modified,
+`D` deleted, `T` type-changed.
+
+If the scrub gate fails (exit 4), the built files remain on disk so you
+can inspect what triggered it. The publish log is not written. Exit codes
+are the same as a full publish (see table below).
+
+`--stage` is incompatible with `--dry-run`, `--diff`, `-m`,
+`--force-overwrite`, and `--amend`/`--no-amend` (exit 1 before any file
+mutation). It works with `--json`, `--quiet`, `--verbose`, and `--config`
+(which selects the target publish directory).
+
+A subsequent `pubrepo` (without `--stage`) performs its own independent
+rebuild and proceeds through commit and push normally. No state from the
+stage is carried forward — the output is advisory.
+
 ## CI integration
 
 `status --check` and `--dry-run` are built for automation:
@@ -173,8 +251,9 @@ GitHub Action step:
   run: pip install pubrepo && pubrepo --dry-run   # exit 4 fails the job
 ```
 
-`--json` gives machine-readable output on `status`, `validate`, and
-`--dry-run`; with it, stdout carries only the JSON document.
+`--json` gives machine-readable output on `status`, `validate`,
+`--dry-run`, and `--stage`; with it, stdout carries only the JSON
+document.
 
 ## vs. the alternatives
 
@@ -202,7 +281,8 @@ construction — neither can ship the other's workdir or config.
 **Non-GitHub remotes?** Any git URL — GitLab, Bitbucket, self-hosted.
 
 **Rollback?** `cd .publish && git revert HEAD && git push`. The next publish
-re-asserts the source state.
+re-asserts the source state. To fix a just-published mistake without adding
+a revert commit, use `pubrepo --amend` instead.
 
 **Someone pushed commits to my public repo — now what?** `pubrepo
 integrate` prints the exact commands to pull their work back into your
@@ -222,6 +302,11 @@ reports uncommitted publish-dir changes separately.
 
 **Flags before the command?** Put them after: `pubrepo status -v`, not
 `pubrepo -v status` (the bare-`pubrepo` shorthand claims the first slot).
+
+**What's the difference between `--stage` and `--dry-run`?** `--dry-run`
+reports what would be published without touching `.publish/`. `--stage`
+performs the full rebuild — files land on disk in `.publish/` for
+hands-on inspection — but stops before commit and push.
 
 **Windows?** Best effort: locking is a no-op and CI doesn't test it.
 

@@ -5,6 +5,26 @@
 First public release as **pubrepo** (previously an internal publishing tool).
 
 ### Added
+- `--amend` / `--no-amend` flags: `--amend` replaces the last published
+  commit instead of appending a new one — full rebuild, same scrub gate,
+  push with `--force-with-lease` pinned to the fetched sha. Refuses
+  foreign commits (exit 5) and verifies the last commit is a pubrepo
+  snapshot. Author identity preserved; author and committer dates
+  refreshed. `--no-amend` forces a new commit, overriding the config
+  default. Incompatible with `--force-overwrite`, `--stage`, `--dry-run`,
+  `--diff`.
+- `on_republish` config key (`"new_commit"` | `"amend"`, default
+  `"new_commit"`): sets the project default for re-publishing. CLI
+  `--amend` / `--no-amend` overrides. On first publish with no prior
+  commit, config amend falls back to a new commit automatically.
+- Publish log entries now include `amend` (bool) and `amended_from`
+  (sha or null) fields on every entry (success, scrub-failed, amend).
+- `--stage` flag: performs the full nuke/rebuild (copy, transform, scrub)
+  and reports what changed, then stops — no commit, no push, no log entry,
+  no tags. Built files stay on disk for inspection. Baseline is the local
+  `.publish/` HEAD (remote never contacted). Works with `--json` for
+  machine-readable change reports. Incompatible with `--dry-run`, `--diff`,
+  `-m`, `--force-overwrite`.
 - `integrate` subcommand: prints (never executes) a copy-paste recipe for
   pulling foreign public-repo commits back into source — foreign range
   from the last snapshot, files filtered through the manifest engine,
@@ -56,3 +76,6 @@ First public release as **pubrepo** (previously an internal publishing tool).
   destroyed); keep-file edits now show in `status`.
 - `init` no longer hides clone failures behind a silent fallback.
 - Transform rule values are validated at config load.
+- Transform target paths are validated: absolute paths and paths that
+  escape the publish directory (via `..`) are rejected; overlap with
+  `keep` entries (exact or nested) is rejected.

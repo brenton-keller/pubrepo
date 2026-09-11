@@ -29,16 +29,18 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from contextlib import contextmanager, suppress
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 try:
@@ -291,14 +293,14 @@ def publish_lock(publish_dir: Path):
             f.close()  # closing the fd releases the flock
 
 
-def git(*args, cwd=None, check=True):
+def git(*args, cwd=None, check=True, env=None):
     """Run a git command, returning the CompletedProcess.
 
     With check=True, a nonzero exit raises GitError.
     """
     result = subprocess.run(
         ["git"] + list(args),
-        cwd=cwd, capture_output=True, text=True,
+        cwd=cwd, capture_output=True, text=True, env=env,
     )
     if check and result.returncode != 0:
         raise GitError(list(args), result.stderr)
@@ -324,7 +326,7 @@ def _warning(field: str, message: str) -> dict:
 
 
 KNOWN_PUBLISH_KEYS = {"remote", "branch", "dir", "include", "exclude", "keep",
-                      "scrub", "transforms"}
+                      "scrub", "transforms", "on_republish"}
 KNOWN_SCRUB_KEYS = {"forbidden"}
 KNOWN_RULE_KEYS = {"find", "replace", "strip_between"}
 
@@ -452,6 +454,36 @@ def validate_config(config: dict) -> list[dict]:
                     if k not in KNOWN_RULE_KEYS:
                         f.append(_warning("transforms", f"{prefix} unknown key '{k}' (ignored)"))
 
+    if isinstance(keep, list) and isinstance(transforms, dict):
+        keep_set = {k for k in keep if isinstance(k, str)}
+        for target in transforms:
+            normalized = posixpath.normpath(target)
+            if os.path.isabs(normalized):
+                f.append(_err("transforms",
+                    f"transform target '{target}' is an absolute path — "
+                    f"transform paths must be relative to the publish directory"))
+                continue
+            if normalized == ".." or normalized.startswith("../"):
+                f.append(_err("transforms",
+                    f"transform target '{target}' escapes the publish directory"))
+                continue
+            parts = PurePosixPath(normalized).parts
+            if not parts:
+                continue
+            if parts[0] in keep_set:
+                f.append(_err("keep",
+                    f"transform target '{target}' is inside kept entry "
+                    f"'{parts[0]}' — transforms on kept content compound "
+                    f"across rebuilds; move the content into an included source "
+                    f"file or remove from keep"))
+
+    on_republish = config.get("on_republish")
+    if on_republish is not None and (
+            not isinstance(on_republish, str)
+            or on_republish not in ("new_commit", "amend")):
+        f.append(_err("on_republish",
+            f'on_republish must be "new_commit" or "amend" (got {on_republish!r})'))
+
     for k in config:
         if k not in KNOWN_PUBLISH_KEYS:
             f.append(_warning("publish", f"unknown key '{k}' in [publish] (ignored)"))
@@ -541,6 +573,7 @@ def load_publish_config(path: Path, strict: bool = True) -> dict:
     config.setdefault("dir", PUBLISH_DIR_NAME)
     config.setdefault("exclude", [])
     config.setdefault("keep", [])
+    config.setdefault("on_republish", "new_commit")
 
     if strict:
         findings = validate_config(config)
@@ -753,7 +786,11 @@ def apply_transforms(publish_dir: Path, transforms: dict) -> list[str]:
 
         new_content = apply_transform_rules(content, rules, warn=_warn)
         if new_content != content:
-            target.write_text(new_content, errors="surrogateescape")
+            try:
+                target.write_text(new_content, errors="surrogateescape")
+            except OSError as e:
+                raise PublishError(
+                    f"ERROR: cannot write transformed file '{filename}': {e}") from e
             transformed.append(filename)
     return transformed
 
@@ -914,6 +951,25 @@ def build_commit_message(source_hash: str, is_dirty: bool, custom_message: str |
             f"Scrub: {scrub_patterns} pattern(s) passed\n")
 
 
+def _split_tool_message(body: str) -> tuple[str, str] | None:
+    """Split a commit message at the LAST 'Source:' line; None if absent.
+
+    Returns (title_block, trailer) where title_block is everything before
+    the last 'Source:' line, rstrip'd.  The same 'last Source: line' rule
+    the fallback parser at get_last_publish_info uses.
+    """
+    lines = body.split("\n")
+    last_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("Source:"):
+            last_idx = i
+    if last_idx is None:
+        return None
+    title_block = "\n".join(lines[:last_idx]).rstrip("\n")
+    trailer = "\n".join(lines[last_idx:])
+    return (title_block, trailer)
+
+
 PUBLISH_LOG_NAME = "pubrepo-log.jsonl"
 
 
@@ -950,10 +1006,12 @@ def _read_last_log_publish(publish_dir: Path) -> dict | None:
         source = str(entry.get("source_commit", "?"))
         if entry.get("source_dirty"):
             source += " (dirty)"
+        public_commit_raw = str(entry.get("public_commit") or "?")
         return {
-            "commit": str(entry.get("public_commit") or "?")[:12],
+            "commit": public_commit_raw[:12],
             "date": entry.get("ts", "?"),
             "source": source,
+            "public_commit_full": public_commit_raw if public_commit_raw != "?" else None,
         }
     return None
 
@@ -1662,9 +1720,74 @@ def _warn_if_publish_dir_tracked(source_root: Path, publish_dir: Path) -> None:
                 f"  echo '{publish_dir.name}/' >> .gitignore")
 
 
+def _count_changes(publish_dir: Path, env=None
+                   ) -> tuple[int, int, int, list[tuple[str, str]]]:
+    """Parse git diff --cached --name-status -z into counts and file list.
+
+    Returns (added, modified, deleted, [(status_letter, path), ...]).
+    Raises PublishError on nonzero git exit.
+    """
+    kwargs = {"cwd": str(publish_dir), "check": False}
+    if env is not None:
+        kwargs["env"] = env
+    result = git("diff", "--cached", "--no-renames", "--name-status", "-z",
+                 **kwargs)
+    if result.returncode != 0:
+        raise PublishError(
+            f"Failed to read staged changes: {result.stderr.strip()}")
+    n_added = n_modified = n_deleted = 0
+    files: list[tuple[str, str]] = []
+    parts = result.stdout.split("\0")
+    i = 0
+    while i + 1 < len(parts):
+        code = parts[i].strip()
+        path = parts[i + 1]
+        if not code:
+            i += 1
+            continue
+        letter = code[0]
+        if letter == "A":
+            n_added += 1
+        elif letter == "M":
+            n_modified += 1
+        elif letter == "D":
+            n_deleted += 1
+        elif letter == "T":
+            n_modified += 1
+        files.append((letter, path))
+        i += 2
+    return n_added, n_modified, n_deleted, files
+
+
+def resolve_republish_mode(config: dict, cli_amend: bool | None,
+                          force_overwrite: bool) -> str | None:
+    """Return None (new commit), "cli", or "config".  Raises ConfigError on
+    amend+overwrite in any combination."""
+    on_republish = config.get("on_republish", "new_commit")
+    if cli_amend is True:
+        if force_overwrite:
+            raise ConfigError(
+                "--amend and --force-overwrite are incompatible (conflicting intent): "
+                "--amend rewrites your own last snapshot and refuses foreign commits; "
+                "--force-overwrite reasserts the mirror over foreign commits with a "
+                "new snapshot. Run --force-overwrite first, then --amend for later "
+                "fix-ups.")
+        return "cli"
+    if cli_amend is False:
+        return None
+    if on_republish == "amend":
+        if force_overwrite:
+            raise ConfigError(
+                "on_republish = \"amend\" cannot be combined with --force-overwrite; "
+                "pass --no-amend to reassert the mirror with a new snapshot.")
+        return "config"
+    return None
+
+
 def cmd_publish(source_root: Path, config: dict, custom_message: str | None = None,
-                force_overwrite: bool = False) -> None:
-    """Full publish cycle."""
+                force_overwrite: bool = False, stage_only: bool = False,
+                as_json: bool = False, amend_mode: str | None = None) -> int:
+    """Full publish cycle (or stage-only preview when stage_only=True)."""
     publish_dir = source_root / config.get("dir", PUBLISH_DIR_NAME)
     branch = config["branch"]
 
@@ -1685,8 +1808,10 @@ def cmd_publish(source_root: Path, config: dict, custom_message: str | None = No
         old_handler = None
     try:
         with publish_lock(publish_dir):
-            _publish_under_lock(source_root, publish_dir, branch, config,
-                                custom_message, force_overwrite)
+            return _publish_under_lock(source_root, publish_dir, branch, config,
+                                       custom_message, force_overwrite,
+                                       stage_only=stage_only, as_json=as_json,
+                                       amend_mode=amend_mode)
     except KeyboardInterrupt:
         # House git-safety rules treat reset --hard and clean -fd as
         # destructive. They are correct HERE, and only here: every byte
@@ -1702,8 +1827,85 @@ def cmd_publish(source_root: Path, config: dict, custom_message: str | None = No
             signal.signal(signal.SIGTERM, old_handler)
 
 
+def _verify_amend_target(publish_dir: Path, baseline_sha: str | None,
+                         fetched_sha: str | None, remote_branch_exists: bool,
+                         amend_mode: str) -> tuple[str, str] | None:
+    """Return (pre_amend_sha, reused_title) when HEAD may be amended.
+    Return None when config mode must fall back to a new commit (A1/A2).
+    Raise PublishError (exit 2) for A1/A2 in cli mode and for A4/A6/A7/A8.
+    Called only after the divergence check has passed (behind == 0)."""
+    is_cli = amend_mode == "cli"
+    prefix = "ERROR: --amend:" if is_cli else "ERROR: on_republish = \"amend\":"
+
+    # O1: HEAD exists
+    if baseline_sha is None:
+        if is_cli:
+            raise PublishError(f"{prefix} no previous publish to amend")
+        ui.info('on_republish = "amend": no previous publish to amend; '
+                "creating the first snapshot commit")
+        return None
+
+    # O2: Remote branch exists
+    if not remote_branch_exists or not fetched_sha:
+        if is_cli:
+            raise PublishError(f"{prefix} nothing on the remote to amend")
+        ui.info('on_republish = "amend": no previous publish to amend; '
+                "creating the first snapshot commit")
+        return None
+
+    # O3: Remote tip is HEAD (inequality → local ahead since behind==0)
+    if fetched_sha != baseline_sha:
+        ahead = int(git("rev-list", "--count", f"{fetched_sha}..HEAD",
+                        cwd=str(publish_dir)).stdout.strip())
+        raise PublishError(
+            f"{prefix} HEAD has {ahead} commit(s) not on the remote; "
+            f"run a normal publish first")
+
+    # O4: Not a merge
+    parents_out = git("rev-list", "--parents", "-n", "1", "HEAD",
+                      cwd=str(publish_dir)).stdout.strip()
+    if len(parents_out.split()) > 2:
+        raise PublishError(
+            f"{prefix} HEAD is a merge commit — not a pubrepo snapshot")
+
+    # O5: Provenance
+    log_entry = _read_last_log_publish(publish_dir)
+    body = git("log", "-1", "--format=%B", "HEAD",
+               cwd=str(publish_dir), check=False).stdout.strip()
+
+    if log_entry is not None and log_entry.get("public_commit_full"):
+        # O5a: log is authoritative
+        if log_entry["public_commit_full"] != baseline_sha:
+            d = log_entry["public_commit_full"][:12]
+            c = baseline_sha[:12]
+            raise PublishError(
+                f"{prefix} publish log records the last publish as {d} but "
+                f"HEAD is {c}. If the remote is correct: git -C "
+                f"{publish_dir.name} fetch && run a normal publish. "
+                f"Then --amend works again.")
+    else:
+        # O5b: no successful log entry — require trailer
+        split = _split_tool_message(body)
+        if split is None:
+            c = baseline_sha[:12]
+            raise PublishError(
+                f"{prefix} HEAD {c} is not a pubrepo snapshot "
+                f"(no 'Source:' trailer). Publish a new snapshot instead "
+                f"(--no-amend), or restore the clone: {_PROG} init")
+
+    split = _split_tool_message(body)
+    if split is not None:
+        reused_title = split[0]
+    else:
+        reused_title = git("log", "-1", "--format=%s",
+                           cwd=str(publish_dir)).stdout.strip()
+    return (baseline_sha, reused_title)
+
+
 def _publish_under_lock(source_root: Path, publish_dir: Path, branch: str, config: dict,
-                        custom_message: str | None, force_overwrite: bool) -> None:
+                        custom_message: str | None, force_overwrite: bool,
+                        stage_only: bool = False, as_json: bool = False,
+                        amend_mode: str | None = None) -> int:
     """cmd_publish's mutation span; the caller holds the publish lock."""
     _last_mark = time.monotonic()
 
@@ -1716,66 +1918,101 @@ def _publish_under_lock(source_root: Path, publish_dir: Path, branch: str, confi
     # --- Remote preamble: discover every remote problem BEFORE the nuke, ---
     # --- so a refused publish leaves .publish/ untouched (M4).           ---
     diverged_count = 0
-    try:
-        # 1. Fetch. A missing remote branch (first publish to an empty repo)
-        #    is not an error; anything else is.
-        fetch = git("fetch", "origin", branch, cwd=str(publish_dir), check=False)
-        remote_branch_exists = fetch.returncode == 0
-        if not remote_branch_exists and "couldn't find remote ref" not in fetch.stderr.lower():
-            raise PublishError(f"ERROR: cannot reach remote; publish requires push access.\n"
-                               f"{fetch.stderr.strip()}")
+    fetched_sha = None
+    remote_branch_exists = False
+    pre_amend_sha = reused_title = None
 
-        # 2. The publish clone must sit on the configured branch.
-        head = git("symbolic-ref", "--short", "HEAD", cwd=str(publish_dir), check=False)
-        current_branch = head.stdout.strip() if head.returncode == 0 else None
-        if current_branch != branch:
-            state = f"on branch '{current_branch}'" if current_branch else "in detached HEAD state"
-            raise PublishError(f"ERROR: {publish_dir.name}/ is {state}, but the configured "
-                               f"branch is '{branch}'.\n"
-                               f"Fix: git -C {publish_dir.name} checkout {branch}")
+    if not stage_only:
+        try:
+            fetch = git("fetch", "origin", branch, cwd=str(publish_dir), check=False)
+            remote_branch_exists = fetch.returncode == 0
+            if not remote_branch_exists and "couldn't find remote ref" not in fetch.stderr.lower():
+                raise PublishError(
+                    f"ERROR: cannot reach remote; publish requires push access.\n"
+                    f"{fetch.stderr.strip()}")
+        except GitError as e:
+            raise PublishError(f"Remote check failed: {e}") from e
 
-        # 3. Pin the sha the user is (possibly) overwriting — the lease target.
-        fetched_sha = None
-        if remote_branch_exists:
-            rev = git("rev-parse", f"origin/{branch}", cwd=str(publish_dir), check=False)
-            if rev.returncode == 0:
-                fetched_sha = rev.stdout.strip()
+    # Branch invariant — always runs, no network
+    head_ref = git("symbolic-ref", "--short", "HEAD", cwd=str(publish_dir), check=False)
+    current_branch = head_ref.stdout.strip() if head_ref.returncode == 0 else None
+    if current_branch != branch:
+        state = (f"on branch '{current_branch}'" if current_branch
+                 else "in detached HEAD state")
+        raise PublishError(
+            f"ERROR: {publish_dir.name}/ is {state}, but the configured "
+            f"branch is '{branch}'.\n"
+            f"Fix: git -C {publish_dir.name} checkout {branch}")
 
-        # 4. Divergence: remote commits not reachable from HEAD.
-        if fetched_sha:
-            head_valid = git("rev-parse", "--verify", "-q", "HEAD",
-                             cwd=str(publish_dir), check=False).returncode == 0
-            rev_range = f"HEAD..{fetched_sha}" if head_valid else fetched_sha
-            diverged_count = int(git("rev-list", "--count", rev_range,
-                                     cwd=str(publish_dir)).stdout.strip())
-            if diverged_count > 0 and not force_overwrite:
-                log_out = git("log", "--oneline", rev_range,
-                              cwd=str(publish_dir), check=False).stdout.rstrip()
-                snap = git("rev-parse", "--short", "HEAD",
-                           cwd=str(publish_dir), check=False).stdout.strip()
-                base = (get_last_publish_info(publish_dir) or {}).get("source")
-                base_note = f" (Source: {base})" if base else ""
-                raise Diverged(
-                    log_out.splitlines(),
-                    f"ERROR: the public repo has {diverged_count} commit(s) not produced by this tool:\n"
-                    f"{log_out}\n\n"
-                    f"They sit on top of your last snapshot {snap}{base_note}.\n"
-                    f"pubrepo maintains a one-way mirror: apply these changes to the source "
-                    f"repo, then republish with --force-overwrite.\n"
-                    f"Run `{_PROG} integrate` for a copy-paste integration recipe "
-                    f"(docs/integrating-changes.md explains the workflow).")
-    except GitError as e:
-        # Preamble git failures are publish failures too (§8 code 2).
-        raise PublishError(f"Remote check failed: {e}") from e
-    ui.info(f"Fetching origin/{branch}... ok")
-    _mark("remote checks")
+    # Resolve baseline SHA before nuke — available on ALL output paths
+    head_rev = git("rev-parse", "HEAD", cwd=str(publish_dir), check=False)
+    baseline_sha = head_rev.stdout.strip() if head_rev.returncode == 0 else None
+
+    if not stage_only:
+        try:
+            if remote_branch_exists:
+                rev = git("rev-parse", f"origin/{branch}",
+                          cwd=str(publish_dir), check=False)
+                if rev.returncode == 0:
+                    fetched_sha = rev.stdout.strip()
+
+            if fetched_sha:
+                head_valid = git("rev-parse", "--verify", "-q", "HEAD",
+                                 cwd=str(publish_dir), check=False).returncode == 0
+                rev_range = f"HEAD..{fetched_sha}" if head_valid else fetched_sha
+                diverged_count = int(git("rev-list", "--count", rev_range,
+                                         cwd=str(publish_dir)).stdout.strip())
+                if diverged_count > 0 and not force_overwrite:
+                    log_out = git("log", "--oneline", rev_range,
+                                  cwd=str(publish_dir), check=False).stdout.rstrip()
+                    snap = git("rev-parse", "--short", "HEAD",
+                               cwd=str(publish_dir), check=False).stdout.strip()
+                    base = (get_last_publish_info(publish_dir) or {}).get("source")
+                    base_note = f" (Source: {base})" if base else ""
+                    amend_hint = ""
+                    if amend_mode:
+                        if amend_mode == "cli":
+                            amend_hint = (
+                                f"\n--amend cannot be combined with --force-overwrite. "
+                                f"Run '{_PROG} --force-overwrite' (new snapshot) first, "
+                                f"then --amend for later fix-ups.")
+                        else:
+                            amend_hint = (
+                                f"\n--amend cannot be combined with --force-overwrite. "
+                                f"Run '{_PROG} --no-amend --force-overwrite' (new snapshot) first, "
+                                f"then --amend for later fix-ups.")
+                    raise Diverged(
+                        log_out.splitlines(),
+                        f"ERROR: the public repo has {diverged_count} commit(s) not produced by this tool:\n"
+                        f"{log_out}\n\n"
+                        f"They sit on top of your last snapshot {snap}{base_note}.\n"
+                        f"pubrepo maintains a one-way mirror: apply these changes to the source "
+                        f"repo, then republish with --force-overwrite.\n"
+                        f"Run `{_PROG} integrate` for a copy-paste integration recipe "
+                        f"(docs/integrating-changes.md explains the workflow).{amend_hint}")
+        except GitError as e:
+            raise PublishError(f"Remote check failed: {e}") from e
+
+        if amend_mode:
+            verified = _verify_amend_target(
+                publish_dir, baseline_sha, fetched_sha,
+                remote_branch_exists, amend_mode)
+            if verified is None:
+                amend_mode = None
+            else:
+                pre_amend_sha, reused_title = verified
+                ui.info(f"Amending {pre_amend_sha[:12]} "
+                        f"({'title from -m' if custom_message else 'title reused'})")
+
+        ui.info(f"Fetching origin/{branch}... ok")
+        _mark("remote checks")
 
     source_hash, is_dirty = get_source_info(source_root)
 
     # Nuke and rebuild
     nuke_publish_dir(publish_dir, config["keep"])
     copied = copy_includes(source_root, publish_dir, config["include"], config["exclude"])
-    ui.info(f"Rebuilding {PUBLISH_DIR_NAME}/ ({len(copied)} files)... ok")
+    ui.info(f"Rebuilding {publish_dir.name}/ ({len(copied)} files)... ok")
     _mark("rebuild")
 
     # Apply transforms
@@ -1790,24 +2027,46 @@ def _publish_under_lock(source_root: Path, publish_dir: Path, branch: str, confi
 
     # Scrub check — BEFORE staging/committing
     forbidden = config.get("scrub", {}).get("forbidden", [])
+    scrub_results = []
     if forbidden:
         scrub_results = scrub_check(publish_dir, forbidden)
         if scrub_results:
-            _append_publish_log(publish_dir, {
-                "ts": datetime.now().astimezone().isoformat(),
-                "source_commit": source_hash,
-                "source_branch": _source_branch(source_root),
-                "source_dirty": is_dirty,
-                "files": len(copied),
-                "added": None, "modified": None, "deleted": None,
-                "transforms_applied": len(transformed),
-                "scrub_patterns": len(forbidden),
-                "scrub_result": "failed",
-                "pushed": False,
-                "public_commit": None,
-                "forced": False,
-                "title": custom_message or None,
-            })
+            if not stage_only:
+                _append_publish_log(publish_dir, {
+                    "ts": datetime.now().astimezone().isoformat(),
+                    "source_commit": source_hash,
+                    "source_branch": _source_branch(source_root),
+                    "source_dirty": is_dirty,
+                    "files": len(copied),
+                    "added": None, "modified": None, "deleted": None,
+                    "transforms_applied": len(transformed),
+                    "scrub_patterns": len(forbidden),
+                    "scrub_result": "failed",
+                    "pushed": False,
+                    "public_commit": None,
+                    "forced": False,
+                    "title": custom_message or None,
+                    "amend": bool(amend_mode),
+                    "amended_from": None,
+                })
+            if stage_only and as_json:
+                print(json.dumps({
+                    "staged": False,
+                    "changed": None,
+                    "baseline": {"ref": "HEAD", "sha": baseline_sha},
+                    "remote_checked": False,
+                    "changes": None,
+                    "files_copied": len(copied),
+                    "transforms_applied": transformed,
+                    "scrub": {
+                        "passed": False,
+                        "patterns": len(forbidden),
+                        "matches": scrub_results,
+                    },
+                    "source": {"commit": source_hash, "dirty": is_dirty},
+                    "publish_dir": publish_dir.name,
+                }))
+                return EXIT_SCRUB_FAILED
             detail = "\n".join(
                 f"  {r['file']}: {r.get('error') or ', '.join(r['matches'])}"
                 for r in scrub_results)
@@ -1821,101 +2080,265 @@ def _publish_under_lock(source_root: Path, publish_dir: Path, branch: str, confi
             ui.info(f"Scrubbing ({len(copied)} files, {len(forbidden)} patterns)... ok")
         _mark("scrub")
 
-    # Stage everything
+    # --- Stage-only: ephemeral index for change reporting, no commit ---
+    if stage_only:
+        tmp_idx_fd, tmp_idx_path = tempfile.mkstemp(
+            dir=str(publish_dir / ".git"), prefix="stage-idx-")
+        os.close(tmp_idx_fd)
+        cleanup_failed = False
+        try:
+            idx_env = {**os.environ, "GIT_INDEX_FILE": tmp_idx_path}
+
+            if baseline_sha is not None:
+                git("read-tree", "HEAD", cwd=str(publish_dir), env=idx_env)
+            else:
+                git("read-tree", "--empty", cwd=str(publish_dir), env=idx_env)
+
+            git("add", "-A", cwd=str(publish_dir), env=idx_env)
+
+            result = git("diff", "--cached", "--quiet",
+                         cwd=str(publish_dir), check=False, env=idx_env)
+            if result.returncode > 1:
+                raise PublishError(
+                    f"Stage diff check failed (git exit {result.returncode}): "
+                    f"{result.stderr.strip()}")
+            has_changes = result.returncode == 1
+
+            n_added = n_modified = n_deleted = 0
+            change_files: list[tuple[str, str]] = []
+            if has_changes:
+                n_added, n_modified, n_deleted, change_files = \
+                    _count_changes(publish_dir, env=idx_env)
+        except GitError as e:
+            raise PublishError(
+                f"Stage reporting failed: {e.stderr.strip()}") from e
+        finally:
+            for path_to_clean in (tmp_idx_path, tmp_idx_path + ".lock"):
+                try:
+                    os.unlink(path_to_clean)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    cleanup_failed = True
+
+        if cleanup_failed:
+            raise PublishError(
+                f"Stage completed but could not remove temporary index in "
+                f"{publish_dir.name}/.git/ — remove stage-idx-* files manually")
+
+        _mark("stage diff")
+
+        if as_json:
+            print(json.dumps({
+                "staged": True,
+                "changed": has_changes,
+                "baseline": {"ref": "HEAD", "sha": baseline_sha},
+                "remote_checked": False,
+                "changes": {
+                    "added": n_added,
+                    "modified": n_modified,
+                    "deleted": n_deleted,
+                    "files": [{"status": s, "path": p} for s, p in change_files],
+                },
+                "files_copied": len(copied),
+                "transforms_applied": transformed,
+                "scrub": {"passed": True, "patterns": len(forbidden)},
+                "source": {"commit": source_hash, "dirty": is_dirty},
+                "publish_dir": publish_dir.name,
+            }))
+        elif has_changes:
+            total = n_added + n_modified + n_deleted
+            parts = []
+            if n_added:
+                parts.append(f"{n_added} added")
+            if n_modified:
+                parts.append(f"{n_modified} modified")
+            if n_deleted:
+                parts.append(f"{n_deleted} deleted")
+            ui.success(f"Staged: {', '.join(parts)}")
+            for status, path in change_files:
+                ui.info(f"  {status}  {path}")
+            ui.info(f"Inspect with: git -C {shlex.quote(publish_dir.name)} status --short")
+        else:
+            ui.success("Nothing to publish")
+
+        return EXIT_SUCCESS
+
+    # --- Full publish: stage, commit, push ---
     try:
         git("add", "-A", cwd=str(publish_dir))
+    except GitError as e:
+        raise PublishError(
+            f"ERROR: staging failed: {e.stderr.strip()}") from e
 
-        # Check for changes
+    if amend_mode:
+        # §5.1 No-op detection (A10/A11/A21)
         result = git("diff", "--cached", "--quiet", cwd=str(publish_dir), check=False)
-        if result.returncode == 0:
+        content_changed = result.returncode != 0
+        title_changed = (custom_message is not None
+                         and custom_message != reused_title)
+        if not content_changed and not title_changed:
             ui.success("Nothing to publish")
-            return
+            return EXIT_SUCCESS
 
-        # Build and apply commit from the staged reality
-        counts = git("diff", "--cached", "--no-renames", "--name-status",
-                     cwd=str(publish_dir), check=False)
-        n_added = n_modified = n_deleted = 0
-        for line in counts.stdout.splitlines():
-            code = line.split("\t", 1)[0].strip()
-            if code.startswith("A"):
-                n_added += 1
-            elif code.startswith("M"):
-                n_modified += 1
-            elif code.startswith("D"):
-                n_deleted += 1
+        # §5.2 Commit
+        n_added, n_modified, n_deleted, _ = _count_changes(publish_dir)
+        amend_title = custom_message if custom_message is not None else reused_title
         message = build_commit_message(
-            source_hash, is_dirty, custom_message,
+            source_hash, is_dirty, amend_title,
             source_branch=_source_branch(source_root),
             added=n_added, modified=n_modified, deleted=n_deleted,
             transform_count=len(transformed), scrub_patterns=len(forbidden))
-        git("commit", "-m", message, cwd=str(publish_dir))
-        ui.info("Committing... ok")
-    except GitError as e:
-        # Mid-publish git failures are publish failures (§8 code 2).
-        msg = str(e)
-        if "who you are" in e.stderr or "Author identity unknown" in e.stderr:
-            msg += (f"\nNo git identity in {publish_dir.name}/ — set one:\n"
-                    f"  git -C {publish_dir.name} config user.name 'Your Name'\n"
-                    f"  git -C {publish_dir.name} config user.email 'you@example.com'")
-        raise PublishError(msg) from e
-    _mark("commit")
+        amend_date = datetime.now().astimezone().isoformat(timespec="seconds")
 
-    # Push. With --force-overwrite the lease pins the exact sha the user was
-    # shown at fetch time — anything landing in between gets refused, never
-    # silently destroyed. Force only when actually diverged: a normal push
-    # suffices otherwise, and some server hooks reject any force-push.
-    push_args = ["push", "-u", "origin", branch]
-    if force_overwrite and fetched_sha and diverged_count > 0:
-        push_args = ["push", "-u", f"--force-with-lease=refs/heads/{branch}:{fetched_sha}",
-                     "origin", branch]
-    result = git(*push_args, cwd=str(publish_dir), check=False)
-    if result.returncode != 0:
-        ui.error(f"ERROR: push failed: {result.stderr.strip()}")
-        ui.info("Rolling back local commit...")
-        # Check if this is the root commit (HEAD~1 doesn't exist)
-        has_parent = git("rev-parse", "--verify", "HEAD~1", cwd=str(publish_dir), check=False)
-        if has_parent.returncode == 0:
-            git("reset", "--soft", "HEAD~1", cwd=str(publish_dir))
-        else:
-            git("update-ref", "-d", "HEAD", cwd=str(publish_dir))
-        raise PublishError("Local commit rolled back. Fix the issue and retry.")
-    ui.info("Pushing... ok")
-    _mark("push")
+        # §5.3 Push, rollback, atomicity
+        head_moved = False
+        try:
+            try:
+                git("commit", "--amend", "--date", amend_date, "-m", message,
+                    cwd=str(publish_dir))
+            except GitError as e:
+                msg = str(e)
+                if "who you are" in e.stderr or "Author identity unknown" in e.stderr:
+                    msg += (f"\nNo git identity in {publish_dir.name}/ — set one:\n"
+                            f"  git -C {publish_dir.name} config user.name 'Your Name'\n"
+                            f"  git -C {publish_dir.name} config user.email 'you@example.com'")
+                raise PublishError(msg) from e
+            head_moved = True
+            ui.info("Committing (amend)... ok")
+            _mark("commit")
 
-    public_commit = git("rev-parse", "HEAD", cwd=str(publish_dir),
-                        check=False).stdout.strip()
-    _append_publish_log(publish_dir, {
-        "ts": datetime.now().astimezone().isoformat(),
-        "source_commit": source_hash,
-        "source_branch": _source_branch(source_root),
-        "source_dirty": is_dirty,
-        "files": len(copied),
-        "added": n_added, "modified": n_modified, "deleted": n_deleted,
-        "transforms_applied": len(transformed),
-        "scrub_patterns": len(forbidden),
-        "scrub_result": "passed" if forbidden else "skipped",
-        "pushed": True,
-        "public_commit": public_commit,
-        "forced": bool(force_overwrite and fetched_sha and diverged_count > 0),
-        "title": custom_message or None,
-    })
+            push_args = ["push", "-u",
+                         f"--force-with-lease=refs/heads/{branch}:{fetched_sha}",
+                         "origin", branch]
+            result = git(*push_args, cwd=str(publish_dir), check=False)
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                if "stale info" in stderr:
+                    hint = ("the remote moved after fetch; rerun to "
+                            "re-evaluate divergence.")
+                else:
+                    hint = (f"the remote refused the force-push; --amend needs "
+                            f"force-push permission on '{branch}' (branch "
+                            f"protection / hooks). Publish a new snapshot "
+                            f"instead: --no-amend")
+                raise PublishError(
+                    f"ERROR: push failed: {stderr}\n{hint}")
+        except (Exception, KeyboardInterrupt):
+            if head_moved:
+                rb = git("reset", "--soft", pre_amend_sha,
+                         cwd=str(publish_dir), check=False)
+                if rb.returncode != 0:
+                    new_sha = git("rev-parse", "HEAD",
+                                  cwd=str(publish_dir),
+                                  check=False).stdout.strip()
+                    ui.error(
+                        f"ERROR: could not roll back; HEAD is {new_sha[:12]}. "
+                        f"Restore by hand: git -C {publish_dir.name} "
+                        f"reset --soft {pre_amend_sha}")
+                else:
+                    ui.info(f"Rolling back to the pre-amend commit "
+                            f"{pre_amend_sha[:12]}...")
+            raise
+
+        ui.info("Pushing (force-with-lease)... ok")
+        _mark("push")
+
+        public_commit = git("rev-parse", "HEAD", cwd=str(publish_dir),
+                            check=False).stdout.strip()
+        _append_publish_log(publish_dir, {
+            "ts": datetime.now().astimezone().isoformat(),
+            "source_commit": source_hash,
+            "source_branch": _source_branch(source_root),
+            "source_dirty": is_dirty,
+            "files": len(copied),
+            "added": n_added, "modified": n_modified, "deleted": n_deleted,
+            "transforms_applied": len(transformed),
+            "scrub_patterns": len(forbidden),
+            "scrub_result": "passed" if forbidden else "skipped",
+            "pushed": True,
+            "public_commit": public_commit,
+            "forced": False,
+            "title": custom_message or None,
+            "amend": True,
+            "amended_from": pre_amend_sha,
+        })
+    else:
+        try:
+            result = git("diff", "--cached", "--quiet", cwd=str(publish_dir), check=False)
+            if result.returncode == 0:
+                ui.success("Nothing to publish")
+                return EXIT_SUCCESS
+
+            n_added, n_modified, n_deleted, _ = _count_changes(publish_dir)
+            message = build_commit_message(
+                source_hash, is_dirty, custom_message,
+                source_branch=_source_branch(source_root),
+                added=n_added, modified=n_modified, deleted=n_deleted,
+                transform_count=len(transformed), scrub_patterns=len(forbidden))
+            git("commit", "-m", message, cwd=str(publish_dir))
+            ui.info("Committing... ok")
+        except GitError as e:
+            msg = str(e)
+            if "who you are" in e.stderr or "Author identity unknown" in e.stderr:
+                msg += (f"\nNo git identity in {publish_dir.name}/ — set one:\n"
+                        f"  git -C {publish_dir.name} config user.name 'Your Name'\n"
+                        f"  git -C {publish_dir.name} config user.email 'you@example.com'")
+            raise PublishError(msg) from e
+        _mark("commit")
+
+        # Push. With --force-overwrite the lease pins the exact sha the user was
+        # shown at fetch time — anything landing in between gets refused, never
+        # silently destroyed. Force only when actually diverged: a normal push
+        # suffices otherwise, and some server hooks reject any force-push.
+        push_args = ["push", "-u", "origin", branch]
+        if force_overwrite and fetched_sha and diverged_count > 0:
+            push_args = ["push", "-u", f"--force-with-lease=refs/heads/{branch}:{fetched_sha}",
+                         "origin", branch]
+        result = git(*push_args, cwd=str(publish_dir), check=False)
+        if result.returncode != 0:
+            ui.error(f"ERROR: push failed: {result.stderr.strip()}")
+            ui.info("Rolling back local commit...")
+            has_parent = git("rev-parse", "--verify", "HEAD~1", cwd=str(publish_dir), check=False)
+            if has_parent.returncode == 0:
+                git("reset", "--soft", "HEAD~1", cwd=str(publish_dir))
+            else:
+                git("update-ref", "-d", "HEAD", cwd=str(publish_dir))
+            raise PublishError("Local commit rolled back. Fix the issue and retry.")
+        ui.info("Pushing... ok")
+        _mark("push")
+
+        public_commit = git("rev-parse", "HEAD", cwd=str(publish_dir),
+                            check=False).stdout.strip()
+        _append_publish_log(publish_dir, {
+            "ts": datetime.now().astimezone().isoformat(),
+            "source_commit": source_hash,
+            "source_branch": _source_branch(source_root),
+            "source_dirty": is_dirty,
+            "files": len(copied),
+            "added": n_added, "modified": n_modified, "deleted": n_deleted,
+            "transforms_applied": len(transformed),
+            "scrub_patterns": len(forbidden),
+            "scrub_result": "passed" if forbidden else "skipped",
+            "pushed": True,
+            "public_commit": public_commit,
+            "forced": bool(force_overwrite and fetched_sha and diverged_count > 0),
+            "title": custom_message or None,
+            "amend": False,
+            "amended_from": None,
+        })
 
     # Tag source if working tree is clean
     if not is_dirty:
-        # Compact timestamp: colons are illegal in git ref names.
         now = datetime.now().astimezone()
         tag_name = f"published/{now.strftime('%Y%m%dT%H%M%S')}"
         exists = git("rev-parse", "--verify", "--quiet", f"refs/tags/{tag_name}",
                      cwd=str(source_root), check=False)
         if exists.returncode == 0:
-            # Legitimate when two publishes land in the same second.
             ui.info(f"Tag {tag_name} already exists, skipping")
         else:
             result = git("tag", tag_name, cwd=str(source_root), check=False)
             if result.returncode != 0:
-                # TOCTOU: the tag can appear between the rev-parse pre-check
-                # and here (T9's publish lock closes the realistic window) —
-                # report that case as the skip it is, not as a failure.
                 if "already exists" in result.stderr:
                     ui.info(f"Tag {tag_name} already exists, skipping")
                 else:
@@ -1928,6 +2351,7 @@ def _publish_under_lock(source_root: Path, publish_dir: Path, branch: str, confi
                     ui.warn(f"Tag created locally ({tag_name}) but push failed: {result.stderr.strip()}")
 
     ui.success(f"Published {source_hash}{'  (dirty)' if is_dirty else ''}")
+    return EXIT_SUCCESS
 
 
 KNOWN_COMMANDS = ("publish", "init", "status", "validate", "integrate")
@@ -1970,10 +2394,18 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Publish even if the public repo has diverged; pushes "
                                 "with --force-with-lease pinned to the fetched sha")
     p_publish.add_argument("--json", action="store_true", dest="json_output",
-                           help="Machine-readable output (with --dry-run)")
+                           help="Machine-readable output (with --dry-run or --stage)")
     p_publish.add_argument("--diff", action="store_true",
                            help="Show a unified diff of what would change on the "
                                 "public repo (implies --dry-run; never publishes)")
+    p_publish.add_argument("--stage", action="store_true",
+                           help="Nuke/rebuild the publish directory and report changes, then stop — "
+                                "no commit, no push. Built files stay for inspection")
+    p_publish.add_argument("--amend", action=argparse.BooleanOptionalAction, default=None,
+                           help="Replace your last published commit instead of adding a new one "
+                                "(pushes with --force-with-lease; refuses if the public repo has "
+                                "foreign commits). --no-amend overrides on_republish = \"amend\" "
+                                "in the config")
 
     sub.add_parser("init", parents=[common],
                    help="First-time setup: clone the remote into .publish/")
@@ -2041,15 +2473,40 @@ def main(argv: list[str] | None = None) -> int:
                                      strict=(args.command != "validate"))
 
         if args.command == "publish":
+            if args.stage:
+                if args.dry_run:
+                    raise ConfigError(
+                        "--stage and --dry-run are incompatible "
+                        "(--stage builds real files; --dry-run is virtual)")
+                if args.diff:
+                    raise ConfigError("--stage and --diff are incompatible")
+                if args.message:
+                    raise ConfigError(
+                        "--stage does not commit; -m/--message has no effect")
+                if args.force_overwrite:
+                    raise ConfigError(
+                        "--stage does not push; --force-overwrite has no effect")
+                if args.amend is not None:
+                    raise ConfigError(
+                        "--stage does not commit; --amend/--no-amend has no effect")
+            if args.amend is not None and (args.dry_run or args.diff):
+                raise ConfigError(
+                    "--amend/--no-amend only applies to a real publish "
+                    "(not --dry-run/--diff)")
             if args.diff:
                 # --diff implies --dry-run: previews never publish.
                 return cmd_diff(source_root, config)
-            if args.json_output and not args.dry_run:
-                raise ConfigError("ERROR: --json only applies to status and --dry-run")
+            if args.json_output and not (args.dry_run or args.stage):
+                raise ConfigError("ERROR: --json only applies to status, --dry-run, and --stage")
             if args.dry_run:
                 return cmd_dry_run(source_root, config, as_json=args.json_output)
-            cmd_publish(source_root, config, args.message,
-                        force_overwrite=args.force_overwrite)
+            amend_mode = resolve_republish_mode(
+                config, args.amend, args.force_overwrite)
+            return cmd_publish(source_root, config, args.message,
+                               force_overwrite=args.force_overwrite,
+                               stage_only=args.stage,
+                               as_json=args.json_output and args.stage,
+                               amend_mode=amend_mode)
         elif args.command == "init":
             cmd_init(source_root, config)
         elif args.command == "status":

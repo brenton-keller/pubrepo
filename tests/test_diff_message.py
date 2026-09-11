@@ -145,3 +145,41 @@ def test_dry_run_previews_enriched_message(source_repo, public_remote, run):
     r = run(["--dry-run"], cwd=repo)
     assert "Branch: main" in r.stdout
     assert "Files: 1 (0 added, 1 modified, 0 deleted)" in r.stdout
+
+
+# --- T31: _split_tool_message --------------------------------------------------
+
+import pubrepo
+
+
+def test_split_tool_message_roundtrip():
+    msg = pubrepo.build_commit_message("abc123", False, "My title",
+                                        source_branch="main", added=1)
+    result = pubrepo._split_tool_message(msg)
+    assert result is not None
+    title_block, trailer = result
+    assert title_block == "My title"
+    assert trailer.startswith("Source: abc123")
+
+
+def test_split_tool_message_custom_title_with_source():
+    msg = pubrepo.build_commit_message("abc123", False,
+                                        "My title\nwith Source: in it",
+                                        source_branch="main", added=1)
+    result = pubrepo._split_tool_message(msg)
+    assert result is not None
+    title_block, trailer = result
+    assert title_block == "My title\nwith Source: in it"
+
+
+def test_split_tool_message_no_source():
+    result = pubrepo._split_tool_message("garbage\nno trailer here")
+    assert result is None
+
+
+def test_split_tool_message_default_title():
+    msg = pubrepo.build_commit_message("def456", True, source_branch="dev")
+    result = pubrepo._split_tool_message(msg)
+    assert result is not None
+    title_block, _ = result
+    assert title_block.startswith("publish: ")

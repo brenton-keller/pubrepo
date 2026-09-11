@@ -31,6 +31,7 @@ def _repo(source_repo, public_remote, files=None, **config_extra):
      "warning", "unknown key 'extra'"),
     ({"transforms": {"ghost.py": [{"find": "a", "replace": "b"}]}},
      "warning", "will never run"),
+    ({"on_republish": "sometimes"}, "error", 'on_republish must be "new_commit" or "amend"'),
 ])
 def test_validate_findings(source_repo, public_remote, run, config_extra, level, phrase):
     repo = _repo(source_repo, public_remote, **config_extra)

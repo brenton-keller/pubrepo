@@ -13,6 +13,8 @@ include = ["src/", "pyproject.toml"]         # REQUIRED, non-empty. Literal path
 exclude = ["src/secret.py", "*.snap"]        # default []. Three-rule patterns (below).
 keep    = ["LICENSE"]                        # default []. Top-level names only (no "/"); preserved across
                                              # rebuilds; scrubbed like everything else.
+on_republish = "new_commit"                  # default "new_commit"; "amend" replaces the last commit.
+                                             # CLI --amend / --no-amend overrides.
 
 [publish.scrub]
 forbidden = ["acme-internal", "10.1.2."]     # default []. Literal, case-insensitive, substring.
@@ -35,11 +37,26 @@ forbidden = ["acme-internal", "10.1.2."]     # default []. Literal, case-insensi
 | `include` | list[str] | required, non-empty; entries are literal paths that must exist; `.git`/`.publish*`/the config file are rejected; including the repo root warns |
 | `exclude` | list[str] | three-rule patterns; empty strings and match-all `*` warn |
 | `keep` | list[str] | no `/` (top-level only in v1) |
+| `on_republish` | str | `"new_commit"` (default) or `"amend"`; CLI `--amend` forces amend, `--no-amend` forces a new commit; on first publish with no prior commit, `"amend"` falls back to a new commit; `"amend"` + `--force-overwrite` (without `--no-amend`) is rejected |
 | `scrub.forbidden` | list[str] | literal strings; empty strings warn |
-| `transforms` | table | keys are file paths in the publish set (else warning); each rule has exactly one of `find`+`replace` (both str, `find` non-empty) or `strip_between` (two non-empty strs) |
+| `transforms` | table | keys are file paths in the publish set (else warning); each rule has exactly one of `find`+`replace` (both str, `find` non-empty) or `strip_between` (two non-empty strs); see path validation below |
 
 Unknown keys anywhere produce warnings, never errors (forward
 compatibility).
+
+## Transform path validation
+
+Transform target paths are validated at config load (errors exit 1):
+
+- **Absolute paths** (e.g., `/etc/passwd`) are rejected.
+- **Paths that escape the publish directory** via `..` (e.g.,
+  `../../secret`, `x/../../../etc/passwd`) are rejected after
+  normalization.
+- **Overlap with `keep` entries** is rejected: a transform target that
+  matches or nests inside a kept path would be re-transformed on every
+  rebuild. `keep = ["docs"]` with a transform on `"docs/README.md"` is
+  an error; `keep = ["doc"]` with a transform on `"docs/README.md"` is
+  fine.
 
 ## Exclude patterns: the three rules
 
