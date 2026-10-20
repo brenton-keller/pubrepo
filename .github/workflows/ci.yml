@@ -23,5 +23,7 @@ jobs:
           git config --global user.email ci@pubrepo.test
           git config --global user.name "pubrepo CI"
           git config --global init.defaultBranch main
-      - run: python -m pip install pytest
+      # build, setuptools and twine: the real PyPI build tests (tests/test_ff_release_build.py)
+      # run on every leg instead of skipping.
+      - run: python -m pip install --upgrade pytest build "setuptools>=77" twine
       - run: python -m pytest tests/ -q

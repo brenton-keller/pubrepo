@@ -8,7 +8,7 @@ def _setup(source_repo, public_remote, run, files=None, **config_extra):
     config.update(config_extra)
     repo = source_repo(files or {"a.py": "line1\nline2\n"}, config)
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     return remote, repo
 
@@ -64,10 +64,12 @@ def test_status_and_publish_diff_identical(source_repo, public_remote, run):
 
 
 def test_added_deleted_binary_large(source_repo, public_remote, run):
+    # Design §10 item 2 (extended): blob.bin is allowlisted so the
+    # test stays about the diff; a non-allowlisted binary blocks (AC22).
     remote, repo = _setup(source_repo, public_remote, run,
                           files={"a.py": "x\n", "gone.txt": "bye\n",
                                  "blob.bin": "ok\n", "big.txt": "small\n"},
-                          include=["."])
+                          include=["."], scrub={"allow_opaque": ["blob.bin"]})
     (repo / "new.txt").write_text("hello\n")          # added
     (repo / "gone.txt").unlink()                       # deleted
     (repo / "blob.bin").write_bytes(b"\x00binary")     # becomes binary
@@ -103,14 +105,16 @@ def test_commit_message_structure(source_repo, public_remote, run):
          "transforms": {"a.py": [{"find": "private-name", "replace": "public-name"}]}},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
 
     body = _last_message(repo)
     src_hash = git_run("rev-parse", "--short", "HEAD", cwd=repo).strip()
     assert body.startswith("publish: ")
     assert f"Source: {src_hash}" in body
-    assert "Branch: main" in body
+    # Design §4.3 / §10 item 1: no Branch: line and no (dirty) marker.
+    assert "Branch:" not in body
+    assert "(dirty)" not in body
     assert "Files: 2 (2 added, 0 modified, 0 deleted)" in body
     assert "Transforms: 1 file(s)" in body
     assert "Scrub: 2 pattern(s) passed" in body
@@ -120,7 +124,7 @@ def test_modified_count_on_second_publish(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run)
     (repo / "a.py").write_text("line1\nCHANGED\n")
     git_run("commit", "-aqm", "change", cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Files: 1 (0 added, 1 modified, 0 deleted)" in _last_message(repo)
 
@@ -131,7 +135,7 @@ def test_custom_message_with_source_line_does_not_confuse_status(source_repo, pu
     git_run("commit", "-aqm", "v2", cwd=repo)
     real_hash = git_run("rev-parse", "--short", "HEAD", cwd=repo).strip()
 
-    r = run(["publish", "-m", "tricky title\nSource: bogus123"], cwd=repo)
+    r = run(["publish", "-m", "tricky title\nSource: bogus123", "--yes"], cwd=repo)
     assert r.code == 0
 
     r = run(["status"], cwd=repo)
@@ -143,7 +147,9 @@ def test_dry_run_previews_enriched_message(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run)
     (repo / "a.py").write_text("line1\nCHANGED\n")
     r = run(["--dry-run"], cwd=repo)
-    assert "Branch: main" in r.stdout
+    # Design §4.3 / §10 item 1: no Branch: line and no (dirty) marker.
+    assert "Branch:" not in r.stdout
+    assert "(dirty)" not in r.stdout
     assert "Files: 1 (0 added, 1 modified, 0 deleted)" in r.stdout
 
 
@@ -153,8 +159,8 @@ import pubrepo
 
 
 def test_split_tool_message_roundtrip():
-    msg = pubrepo.build_commit_message("abc123", False, "My title",
-                                        source_branch="main", added=1)
+    # §10 item 1: build_commit_message's keyword-only signature.
+    msg = pubrepo.build_commit_message("abc123", custom_message="My title", added=1)
     result = pubrepo._split_tool_message(msg)
     assert result is not None
     title_block, trailer = result
@@ -163,9 +169,9 @@ def test_split_tool_message_roundtrip():
 
 
 def test_split_tool_message_custom_title_with_source():
-    msg = pubrepo.build_commit_message("abc123", False,
-                                        "My title\nwith Source: in it",
-                                        source_branch="main", added=1)
+    # §10 item 1: build_commit_message's keyword-only signature.
+    msg = pubrepo.build_commit_message("abc123", custom_message="My title\nwith Source: in it",
+                                        added=1)
     result = pubrepo._split_tool_message(msg)
     assert result is not None
     title_block, trailer = result
@@ -178,7 +184,8 @@ def test_split_tool_message_no_source():
 
 
 def test_split_tool_message_default_title():
-    msg = pubrepo.build_commit_message("def456", True, source_branch="dev")
+    # §10 item 1: build_commit_message's keyword-only signature.
+    msg = pubrepo.build_commit_message("def456")
     result = pubrepo._split_tool_message(msg)
     assert result is not None
     title_block, _ = result

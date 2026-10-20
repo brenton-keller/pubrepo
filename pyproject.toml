@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pubrepo"
 dynamic = ["version"]
-description = "Publish a curated, scrubbed subset of a private repo to a clean public repo. The scrub gate makes leaking physically impossible."
+description = "Publish a curated, scrubbed subset of a private repo to a clean public repo. A forbidden-string gate blocks the publish on any hit."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Brenton James Keller" }]
-keywords = ["git", "publish", "scrub", "secrets", "mirror", "monorepo"]
+keywords = ["git", "publish", "scrub", "forbidden-strings", "monorepo"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -32,6 +32,11 @@ Issues = "https://github.com/brenton-keller/pubrepo/issues"
 
 [project.scripts]
 pubrepo = "pubrepo:main"
+
+[project.optional-dependencies]
+# Test dependencies (CI installs the same set): build, setuptools and twine
+# let tests/test_ff_release_build.py run real PyPI builds.
+dev = ["pytest", "build", "setuptools>=77", "twine"]
 
 [tool.setuptools]
 py-modules = ["pubrepo"]

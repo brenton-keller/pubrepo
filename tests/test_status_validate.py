@@ -31,8 +31,11 @@ def _repo(source_repo, public_remote, files=None, **config_extra):
      "warning", "unknown key 'extra'"),
     ({"transforms": {"ghost.py": [{"find": "a", "replace": "b"}]}},
      "warning", "will never run"),
-    ({"on_republish": "sometimes"}, "error", 'on_republish must be "new_commit" or "amend"'),
+    # §10 item 3: "amend" is retired, so only "new_commit" is listed.
+    ({"on_republish": "sometimes"}, "error", 'on_republish must be "new_commit" (got'),
+    ({"on_republish": "amend"}, "error", "retired in 1.1.0"),
 ])
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_validate_findings(source_repo, public_remote, run, config_extra, level, phrase):
     repo = _repo(source_repo, public_remote, **config_extra)
     r = run(["validate"], cwd=repo)
@@ -47,6 +50,7 @@ def test_validate_findings(source_repo, public_remote, run, config_extra, level,
         assert "Config OK" in r.stdout
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_validate_reports_all_errors_at_once(source_repo, public_remote, run):
     """validate must not die at the first error like strict load does."""
     repo = _repo(source_repo, public_remote,
@@ -58,6 +62,7 @@ def test_validate_reports_all_errors_at_once(source_repo, public_remote, run):
     assert "top-level-only" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_validate_json_schema(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote, exclude=[""])
     r = run(["validate", "--json"], cwd=repo)
@@ -81,7 +86,7 @@ def test_strict_load_warns_on_unknown_keys(source_repo, public_remote, run):
 def test_status_sections_render(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
     r = run(["status"], cwd=repo)
     assert r.code == 0
     for section in ("Config:", "  Remote:", "  Rules:", "Source:", "  Branch:   main",
@@ -93,7 +98,7 @@ def test_status_check_exit_codes_and_precedence(source_repo, public_remote, run)
     repo = _repo(source_repo, public_remote,
                  **{"scrub": {"forbidden": ["sekrit"]}})
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
 
     assert run(["status", "--check"], cwd=repo).code == 0      # up to date
 
@@ -106,6 +111,7 @@ def test_status_check_exit_codes_and_precedence(source_repo, public_remote, run)
     assert run(["status"], cwd=repo).code == 0                 # without --check: informational
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_status_check_uninitialized_is_pending(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     assert run(["status", "--check"], cwd=repo).code == 6
@@ -115,11 +121,15 @@ def test_status_check_uninitialized_is_pending(source_repo, public_remote, run):
 def test_status_json_schema(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
     r = run(["status", "--json"], cwd=repo)
     data = json.loads(r.stdout)
+    # Design §10 item 7: the strict key set gains the remote fields.
     assert set(data) == {"status", "config", "source", "last_publish",
-                         "changes", "scrub", "remote"}
+                         "changes", "scrub", "remote", "remote_checked",
+                         "remote_last_fetched", "unpulled", "items", "carried_count",
+                         "predicted_exit"}
+    assert data["remote_checked"] is False
     assert data["status"] == "up_to_date"
     assert data["config"]["include"] == 1
     assert data["source"]["branch"] == "main"
@@ -129,17 +139,18 @@ def test_status_json_schema(source_repo, public_remote, run):
 def test_status_remote_up_to_date_and_diverged(source_repo, public_remote, run, tmp_path):
     repo = _repo(source_repo, public_remote)
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
 
+    # Design §10 item 7: a foreign range is "unpulled", not "DIVERGED".
     r = run(["status", "--remote", "--json"], cwd=repo)
     data = json.loads(r.stdout)
-    assert data["remote"] == {"checked": True, "diverged": False, "ahead_count": 0}
+    assert data["remote"]["checked"] is True and data["remote"]["unpulled"] == 0
 
     remote_url = json.loads(run(["status", "--json"], cwd=repo).stdout)["config"]["remote"]
     _external_commit(remote_url, tmp_path)
 
     r = run(["status", "--remote"], cwd=repo)
-    assert "Remote: DIVERGED" in r.stdout
+    assert "1 unpulled commit(s)" in r.stdout and "DIVERGED" not in r.stdout
     data = json.loads(run(["status", "--remote", "--json"], cwd=repo).stdout)
-    assert data["remote"]["diverged"] is True
-    assert data["remote"]["ahead_count"] == 1
+    assert data["remote"]["unpulled"] == 1
+    assert len(data["unpulled"]) == 1

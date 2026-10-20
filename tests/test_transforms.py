@@ -83,7 +83,7 @@ def test_transforms_applied_in_published_bytes(source_repo, public_remote, run, 
         },
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     tree = published_tree(remote)
     assert tree["conf.py"] == b'name = "public-name"  # \n'
@@ -102,7 +102,7 @@ def test_orphaned_start_scrub_backstop(source_repo, public_remote, run, publishe
         },
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 4                          # scrub caught the survivor
     assert "end marker not found" in r.stderr   # transform warned
     assert published_tree(remote) == {}         # nothing leaked
@@ -121,9 +121,9 @@ def test_post_transform_hash_parity(source_repo, public_remote, run):
         },
     )
     run(["init"], cwd=repo)
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Nothing to publish" in r.stdout
 

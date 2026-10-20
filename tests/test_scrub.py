@@ -17,13 +17,13 @@ def test_unreadable_keep_file_fails_publish(source_repo, public_remote, run):
          "scrub": {"forbidden": ["sekrit"]}},
     )
     run(["init"], cwd=repo)
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
 
     keep_file = repo / ".publish" / "LICENSE"
     keep_file.write_text("whatever\n")
     keep_file.chmod(0o000)
     try:
-        r = run([], cwd=repo)
+        r = run(["publish", "--yes"], cwd=repo)
         assert r.code == 4
         assert "LICENSE" in r.stderr
         assert "could not verify" in r.stderr
@@ -63,9 +63,10 @@ def test_unreadable_source_file_fails_publish_cleanly(source_repo, public_remote
     locked = repo / "locked.txt"
     locked.chmod(0o000)
     try:
-        r = run([], cwd=repo)
+        r = run(["publish", "--yes"], cwd=repo)
         assert r.code == 2
-        assert "cannot copy 'locked.txt'" in r.stderr
+        # Design §10 item 16: publish no longer copies files.
+        assert "cannot read 'locked.txt'" in r.stderr
     finally:
         locked.chmod(0o644)
 
@@ -81,14 +82,14 @@ def test_keep_file_parity_dry_run_vs_publish(source_repo, public_remote, run):
          "scrub": {"forbidden": ["sekrit"]}},
     )
     run(["init"], cwd=repo)
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
     (repo / ".publish" / "LICENSE").write_text("contains sekrit\n")
 
     dry = run(["--dry-run"], cwd=repo)
     assert "SCRUB WOULD FAIL" in dry.stdout
     assert "LICENSE" in dry.stdout
 
-    pub = run([], cwd=repo)
+    pub = run(["publish", "--yes"], cwd=repo)
     assert pub.code == 4
     assert "LICENSE" in pub.stderr
 
@@ -100,19 +101,36 @@ def test_scrub_clean_pass_message(source_repo, public_remote, run):
         {"remote": remote, "include": ["a.py"], "scrub": {"forbidden": ["sekrit", "hush"]}},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Scrubbing (1 files, 2 patterns)... ok" in r.stderr  # T21 progress line
 
 
 def test_binary_files_skip_scrub_with_notice(source_repo, public_remote, run, published_tree):
-    """Binary skip is the documented, principled policy (§7) — unchanged."""
+    """Design §10 item 2: an unscannable binary blocks (exit 4) unless
+    [publish.scrub] allow_opaque lists it."""
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py", "blob.bin"],
                                          "scrub": {"forbidden": ["sekrit"]}})
     (repo / "blob.bin").write_bytes(b"sekrit\x00binary")  # forbidden string + null byte
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
-    assert r.code == 0  # binary content is not scrubbed, by policy
-    assert "skipped binary file: blob.bin" in r.stderr
+    r = run(["publish", "--yes"], cwd=repo)
+    assert r.code == 4
+    assert "blob.bin" in r.stderr
+    assert published_tree(remote) == {}
+
+
+def test_binary_files_allowlisted_publish_with_notice(source_repo, public_remote, run,
+                                                      published_tree):
+    """Design §10 item 2, the allowlisted variant: published, and
+    reported as not scanned."""
+    remote = public_remote()
+    repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py", "blob.bin"],
+                                         "scrub": {"forbidden": ["sekrit"],
+                                                   "allow_opaque": ["blob.bin"]}})
+    (repo / "blob.bin").write_bytes(b"sekrit\x00binary")
+    run(["init"], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
+    assert r.code == 0
+    assert "blob.bin: not scanned (allowlisted)" in r.stderr
     assert "blob.bin" in published_tree(remote)

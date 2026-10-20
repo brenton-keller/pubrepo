@@ -35,7 +35,7 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
 def test_success_entry(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run,
                           **{"scrub": {"forbidden": ["sekrit"]}})
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
 
     entries = _log_entries(repo)
@@ -54,7 +54,7 @@ def test_blocked_entry(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run,
                           **{"scrub": {"forbidden": ["sekrit"]}})
     (repo / "a.py").write_text("the sekrit\n")
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 4
 
     entries = _log_entries(repo)
@@ -68,7 +68,7 @@ def test_blocked_entry(source_repo, public_remote, run):
 
 def test_corrupt_line_tolerated_and_log_authoritative(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run)
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
 
     log = repo / ".publish" / ".git" / "pubrepo-log.jsonl"
     with open(log, "a") as f:
@@ -83,7 +83,7 @@ def test_corrupt_line_tolerated_and_log_authoritative(source_repo, public_remote
 
 def test_status_reads_log_not_commit_message(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run)
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
     # Rewrite the publish commit message to garbage; the log still answers.
     git_run("commit", "--amend", "-qm", "garbage message no source line",
             cwd=repo / ".publish")
@@ -96,21 +96,23 @@ def test_status_reads_log_not_commit_message(source_repo, public_remote, run):
 
 def test_interrupt_mid_copy_restores_tree_exit_130(source_repo, public_remote, run, monkeypatch):
     remote, repo = _setup(source_repo, public_remote, run)
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
 
     publish_dir = repo / ".publish"
     before = _tree_bytes(publish_dir)
     before_head = git_run("rev-parse", "HEAD", cwd=publish_dir).strip()
 
     (repo / "a.py").write_text("v2\n")
-    real_copy = pubrepo.copy_includes
+    # AC75 re-target: copy_includes → build_projection (the rework writes
+    # blobs, not files). Behavioral assertions unchanged.
+    real_projection = pubrepo.build_projection
 
     def interrupting_copy(*args, **kwargs):
-        real_copy(*args, **kwargs)  # half-done state: copy happened...
-        raise KeyboardInterrupt    # ...then ^C lands
+        real_projection(*args, **kwargs)  # half-done state: blobs written...
+        raise KeyboardInterrupt           # ...then ^C lands
 
-    monkeypatch.setattr(pubrepo, "copy_includes", interrupting_copy)
-    r = run([], cwd=repo)
+    monkeypatch.setattr(pubrepo, "build_projection", interrupting_copy)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 130
     assert "restored to last published state" in r.stderr
 
@@ -126,7 +128,7 @@ def test_interrupted_exit_code():
 
 def test_keep_edit_visible_in_status(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run, keep=["LICENSE"])
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
     assert run(["status", "--check"], cwd=repo).code == 0
 
     (repo / ".publish" / "LICENSE").write_text("MIT\n")
@@ -139,5 +141,5 @@ def test_keep_edit_visible_in_status(source_repo, public_remote, run):
     assert data["changes"]["publish_dir_dirty"] is True
 
     # Publishing resolves it.
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
     assert run(["status", "--check"], cwd=repo).code == 0

@@ -26,7 +26,7 @@ def _repo(source_repo, public_remote, files=None, config_extra=None):
 
 def _init_and_publish(run, repo):
     assert run(["init"], cwd=repo).code == 0
-    assert run([], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
 
 
 # =============================================================================
@@ -379,7 +379,8 @@ class TestStageJsonSuccess:
         data = json.loads(r.stdout)
         assert data["staged"] is True
         assert data["changed"] is True
-        assert data["baseline"]["ref"] == "HEAD"
+        # Design §4.5, §10 item 15: the git-tree baseline, not the worktree HEAD.
+        assert data["baseline"]["ref"] == "tip"
         assert isinstance(data["baseline"]["sha"], str)
         assert data["remote_checked"] is False
         assert isinstance(data["changes"]["added"], int)
@@ -427,7 +428,11 @@ class TestStageJsonSuccess:
             assert f["status"] in ("A", "M", "D", "T")
             assert isinstance(f["path"], str)
 
-    def test_json_remote_checked_always_false(self, source_repo, public_remote, run):
+    # AC75: §10 item 9 (the new --remote flag; replaces test_json_remote_checked_always_false, deleted: remote_checked now follows --remote)
+    def test_json_remote_checked_follows_the_remote_flag(self, source_repo, public_remote,
+                                                         run):
+        # Renamed from ..._always_false: offline --stage is
+        # remote_checked false; --stage --remote checks the remote (§4.5).
         remote, repo = _repo(source_repo, public_remote)
         _init_and_publish(run, repo)
         (repo / "a.py").write_text("changed\n")
@@ -436,6 +441,9 @@ class TestStageJsonSuccess:
         r = run(["--stage", "--json"], cwd=repo)
         data = json.loads(r.stdout)
         assert data["remote_checked"] is False
+        r = run(["--stage", "--json", "--remote"], cwd=repo)
+        assert r.code == 0, r.stderr
+        assert json.loads(r.stdout)["remote_checked"] is True
 
     def test_json_publish_dir_field(self, source_repo, public_remote, run):
         remote, repo = _repo(source_repo, public_remote)
@@ -494,6 +502,7 @@ class TestStreamDiscipline:
 # §7 Config validation — keep/transform overlap
 # =============================================================================
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 class TestKeepTransformOverlap:
 
     def test_exact_overlap_rejected(self, source_repo, public_remote, run):
@@ -560,8 +569,8 @@ class TestMultiTarget:
         }))
         run(["init"], cwd=repo)
         run(["init", "--config", ".publish-alt.toml"], cwd=repo)
-        run([], cwd=repo)
-        run(["publish", "--config", ".publish-alt.toml"], cwd=repo)
+        run(["publish", "--yes"], cwd=repo)
+        run(["publish", "--config", ".publish-alt.toml", "--yes"], cwd=repo)
 
         (repo / "a.py").write_text("changed\n")
         git_run("add", "-A", cwd=repo)
@@ -595,8 +604,8 @@ class TestMultiTarget:
         }))
         run(["init"], cwd=repo)
         run(["init", "--config", ".publish-alt.toml"], cwd=repo)
-        run([], cwd=repo)
-        run(["publish", "--config", ".publish-alt.toml"], cwd=repo)
+        run(["publish", "--yes"], cwd=repo)
+        run(["publish", "--config", ".publish-alt.toml", "--yes"], cwd=repo)
 
         lock_path = repo / ".publish" / ".git" / "pubrepo.lock"
         with open(lock_path, "w") as holder:
@@ -631,7 +640,7 @@ class TestStageThenPublish:
             if p.is_file() and ".git" not in rel.parts:
                 staged_tree[str(rel)] = p.read_bytes()
 
-        r = run([], cwd=repo)
+        r = run(["publish", "--yes"], cwd=repo)
         assert r.code == 0
         remote_tree = published_tree(remote)
         assert staged_tree == remote_tree

@@ -16,6 +16,7 @@ def _repo(source_repo, public_remote, **config_extra):
     return source_repo({"a.py": "x\n"}, config)
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_missing_config_suggests_starter(source_repo, public_remote, run, tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -26,6 +27,7 @@ def test_missing_config_suggests_starter(source_repo, public_remote, run, tmp_pa
     assert "pubrepo init" in r.stderr   # _PROG fallback under pytest
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_bad_toml_keeps_line_info(source_repo, public_remote, run, tmp_path):
     repo = tmp_path / "badtoml"
     repo.mkdir()
@@ -36,17 +38,22 @@ def test_bad_toml_keeps_line_info(source_repo, public_remote, run, tmp_path):
     assert "line" in r.stderr                # tomllib's line/col preserved
 
 
+# §10 item 19: the closing hint is the ruled line, and the
+# missing-include check reads local pull records (two read-only git calls) to
+# name a pull that removed the path, so no_git_calls is removed under §10
+# item 19.
 def test_missing_include_path_renamed_hint(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote, include=["a.py", "ghost.py"])
     r = run(["--dry-run"], cwd=repo)
     assert r.code == 1
     assert "not found in working tree" in r.stderr
-    assert "was it renamed?" in r.stderr
+    assert "or restore them (renamed? update include)" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_not_initialized_says_what_to_do(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
-    r = run(["publish"], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 1
     assert "not initialized" in r.stderr
     assert "init" in r.stderr
@@ -69,7 +76,7 @@ def test_identity_less_commit_gives_exact_commands(source_repo, public_remote, r
     subprocess.run(["git", "config", "user.useConfigOnly", "true"], cwd=publish_dir, check=True)
     subprocess.run(["git", "config", "--unset", "user.name"], cwd=publish_dir, capture_output=True)
     subprocess.run(["git", "config", "--unset", "user.email"], cwd=publish_dir, capture_output=True)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 2
     assert "git -C .publish config user.name" in r.stderr
     assert "git -C .publish config user.email" in r.stderr
@@ -82,8 +89,9 @@ def test_unexpected_failure_clean_line_and_verbose_reraise(source_repo, public_r
     def exploding(*args, **kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(pubrepo, "copy_includes", exploding)
-    r = run([], cwd=repo)
+    # AC75 re-target: copy_includes → build_projection. Assertions unchanged.
+    monkeypatch.setattr(pubrepo, "build_projection", exploding)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 1
     assert "unexpected failure" in r.stderr
     assert "RuntimeError" in r.stderr
@@ -91,7 +99,7 @@ def test_unexpected_failure_clean_line_and_verbose_reraise(source_repo, public_r
     assert "Traceback" not in r.stderr
 
     with pytest.raises(RuntimeError):       # --verbose re-raises
-        run(["publish", "-v"], cwd=repo)
+        run(["publish", "-v", "--yes"], cwd=repo)
 
 
 def test_phase_progress_lines(source_repo, public_remote, run):
@@ -99,7 +107,7 @@ def test_phase_progress_lines(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote,
                  **{"scrub": {"forbidden": ["sekrit"]}})
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Fetching origin/main... ok" in r.stderr
     assert "Rebuilding .publish/ (1 files)... ok" in r.stderr
@@ -117,6 +125,6 @@ def test_overlapping_includes_dedupe(source_repo, public_remote, run):
         {"remote": remote, "include": ["src/", "src/app.py"]},  # overlap
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Rebuilding .publish/ (2 files)... ok" in r.stderr  # not 3

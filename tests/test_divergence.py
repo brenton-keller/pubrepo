@@ -30,7 +30,7 @@ def _setup_published(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "v1\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     return remote, repo
 
@@ -46,89 +46,56 @@ def test_diverged_refuses_and_leaves_publish_untouched(source_repo, public_remot
     before_tree = _tree_bytes(publish_dir)
     before_head = git_run("rev-parse", "HEAD", cwd=publish_dir).strip()
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 5
-    assert "not produced by this tool" in r.stderr
-    assert "one-way mirror" in r.stderr
+    # §10 items 3 and 6 (the message changed with the fast-forward model): exit 5
+    # kept; the refusal says to pull, with no mirror or force wording.
+    assert "run `pubrepo pull`" in r.stderr
+    assert "one-way mirror" not in r.stderr
     assert "external: direct edit" in r.stderr  # the commit is listed
-    assert "--force-overwrite" in r.stderr
+    assert "--force-overwrite" not in r.stderr
 
     assert _tree_bytes(publish_dir) == before_tree
     assert git_run("rev-parse", "HEAD", cwd=publish_dir).strip() == before_head
 
 
-def test_force_overwrite_reasserts_source_projection(source_repo, public_remote, run, published_tree, tmp_path):
+def _assert_force_overwrite_retired(run, repo, remote, published_tree, git_recorder):
+    before = published_tree(remote)
+    calls = len(git_recorder.calls())
+    r = run(["--force-overwrite"], cwd=repo)
+    assert r.code == 1
+    assert "pull" in r.stderr and "repair" in r.stderr
+    assert len(git_recorder.calls()) == calls, "exit 1 with zero git calls"
+    assert published_tree(remote) == before
+
+
+# AC75: §10 item 3 (--force-overwrite is removed, exit 1)
+def test_force_overwrite_reasserts_source_projection(source_repo, public_remote, run,
+                                                     published_tree, tmp_path, git_recorder):
+    """Replaced by the AC63 refusal: --force-overwrite
+    exits 1 with zero git calls and points to pull and repair; the foreign
+    commit stays."""
     remote, repo = _setup_published(source_repo, public_remote, run)
     _external_commit(remote, tmp_path)
-
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-
-    r = run(["--force-overwrite"], cwd=repo)
-    assert r.code == 0
-    assert published_tree(remote) == {"a.py": b"v2\n"}  # external.txt gone
+    _assert_force_overwrite_retired(run, repo, remote, published_tree, git_recorder)
+    assert "external.txt" in published_tree(remote)
 
 
-def test_lease_race_refuses_and_rolls_back(source_repo, public_remote, run, published_tree,
-                                           tmp_path, monkeypatch):
-    """A commit landing between fetch and push must be refused by the lease,
-    not silently destroyed."""
-    remote, repo = _setup_published(source_repo, public_remote, run)
-    _external_commit(remote, tmp_path, marker="first")
-
-    (repo / "a.py").write_text("v2\n")
-    git_run("commit", "-aqm", "v2", cwd=repo)
-
-    real_git = pubrepo.git
-    state = {"raced": False}
-
-    def racing_git(*args, cwd=None, check=True):
-        if args and args[0] == "push" and any("force-with-lease" in a for a in args) \
-                and not state["raced"]:
-            state["raced"] = True
-            _external_commit(remote, tmp_path, marker="second")  # between fetch and push
-        return real_git(*args, cwd=cwd, check=check)
-
-    monkeypatch.setattr(pubrepo, "git", racing_git)
-
-    publish_dir = repo / ".publish"
-    pre_head = git_run("rev-parse", "HEAD", cwd=publish_dir).strip()
-
-    r = run(["--force-overwrite"], cwd=repo)
-    assert r.code == 2
-    assert "push failed" in r.stderr
-    assert "rolled back" in r.stderr.lower()
-
-    # The racing commit survived on the remote; the lease refused to destroy it.
-    assert "second.txt" in published_tree(remote)
-    # And the local publish commit was rolled back — HEAD did not advance.
-    assert git_run("rev-parse", "HEAD", cwd=publish_dir).strip() == pre_head
+# test_lease_race_refuses_and_rolls_back: deleted (§10 items 3
+# and 6). No lease in routine publish; the race is AC5
+# (test_ff_publish::test_concurrent_push_exit5_local_ref_unchanged).
 
 
 def test_force_overwrite_without_divergence_pushes_normally(source_repo, public_remote, run,
-                                                            published_tree, monkeypatch):
-    """--force-overwrite on an up-to-date remote must NOT force-push (some
-    server hooks reject any force-push); a normal push suffices."""
+                                                            published_tree, git_recorder):
+    """§10 item 3: --force-overwrite exits 1 with zero git calls
+    even when nothing diverged."""
     remote, repo = _setup_published(source_repo, public_remote, run)
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-
-    real_git = pubrepo.git
-    pushes = []
-
-    def spying_git(*args, cwd=None, check=True):
-        if args and args[0] == "push":
-            pushes.append(args)
-        return real_git(*args, cwd=cwd, check=check)
-
-    monkeypatch.setattr(pubrepo, "git", spying_git)
-
-    r = run(["--force-overwrite"], cwd=repo)
-    assert r.code == 0
-    assert published_tree(remote) == {"a.py": b"v2\n"}
-    branch_pushes = [p for p in pushes if "origin" in p]
-    assert branch_pushes
-    assert not any("force-with-lease" in a for p in branch_pushes for a in p)
+    _assert_force_overwrite_retired(run, repo, remote, published_tree, git_recorder)
 
 
 def test_wrong_branch_refused_with_fix_instruction(source_repo, public_remote, run):
@@ -139,7 +106,7 @@ def test_wrong_branch_refused_with_fix_instruction(source_repo, public_remote, r
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 2
     assert "on branch 'scratch'" in r.stderr
     assert "git -C .publish checkout main" in r.stderr
@@ -150,7 +117,7 @@ def test_detached_head_refused(source_repo, public_remote, run):
     publish_dir = repo / ".publish"
     git_run("checkout", "-q", "--detach", cwd=publish_dir)
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 2
     assert "detached HEAD" in r.stderr
 
@@ -158,13 +125,18 @@ def test_detached_head_refused(source_repo, public_remote, run):
 def test_unreachable_remote_fails_before_nuke(source_repo, public_remote, run):
     remote, repo = _setup_published(source_repo, public_remote, run)
     publish_dir = repo / ".publish"
-    git_run("remote", "set-url", "origin", "/nonexistent/nowhere.git", cwd=publish_dir)
+    # §17.4 sandbox: the unreachable remote is a missing path inside the base.
+    # AC75 re-target (§10 item 20, §18.11 R5): the configured remote's
+    # bare is moved away, so origin still equals [publish] remote for R5
+    # (was: set-url origin to a missing path, which R5 now refuses first)
+    bare = Path(remote.removeprefix("file://"))
+    bare.rename(bare.with_name("moved-away.git"))
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
 
     before_tree = _tree_bytes(publish_dir)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 2
     assert "cannot reach remote" in r.stderr
     assert _tree_bytes(publish_dir) == before_tree  # refused BEFORE the nuke
@@ -175,7 +147,7 @@ def test_first_publish_to_empty_remote_succeeds(source_repo, public_remote, run,
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert published_tree(remote) == {"a.py": b"x\n"}
 
@@ -187,11 +159,13 @@ def test_diverged_message_names_snapshot_and_integrate(source_repo, public_remot
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
 
-    snap = git_run("rev-parse", "--short", "HEAD", cwd=repo / ".publish").strip()
+    foreign = git_run("ls-remote", remote, "refs/heads/main").split()[0]
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 5
-    assert f"last snapshot {snap}" in r.stderr
-    assert "Source:" in r.stderr
-    assert "pubrepo integrate" in r.stderr        # _PROG under pytest
-    assert "docs/integrating-changes.md" in r.stderr
+    # §10 items 3 and 6 (the message changed with the fast-forward model): the
+    # refusal names the foreign commit (AC1) and points at `pubrepo pull`.
+    assert foreign[:7] in r.stderr
+    assert "run `pubrepo pull`" in r.stderr       # _PROG under pytest
+    assert "one-way mirror" not in r.stderr
+    assert "--force-overwrite" not in r.stderr

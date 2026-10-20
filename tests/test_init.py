@@ -2,10 +2,11 @@
 from conftest import git_run
 
 
-def test_clone_failure_surfaces_stderr_exit_2(source_repo, public_remote, run):
+def test_clone_failure_surfaces_stderr_exit_2(source_repo, public_remote, run, tmp_path):
+    # §17.4 sandbox: the unreachable remote is a missing path inside the base.
     repo = source_repo(
         {"a.py": "x\n"},
-        {"remote": "/nonexistent/nowhere.git", "include": ["a.py"]},
+        {"remote": str(tmp_path / "nowhere.git"), "include": ["a.py"]},
     )
     r = run(["init"], cwd=repo)
     assert r.code == 2
@@ -27,7 +28,7 @@ def test_empty_remote_lands_on_configured_branch(source_repo, public_remote, run
     head = git_run("symbolic-ref", "--short", "HEAD", cwd=repo / ".publish").strip()
     assert head == "release"
 
-    r = run([], cwd=repo)  # full publish lands on that branch
+    r = run(["publish", "--yes"], cwd=repo)  # full publish lands on that branch
     assert r.code == 0
     ls = git_run("ls-remote", remote)
     assert "refs/heads/release" in ls
@@ -95,13 +96,13 @@ def test_publish_warns_when_publish_dir_tracked(source_repo, public_remote, run)
     assert run(["init"], cwd=repo).code == 0
     # First publish gives .publish/.git a commit; only then can the classic
     # mistake (git add . sweeping in the embedded repo as a gitlink) happen.
-    assert run(["publish"], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
     subprocess.run(["git", "add", "-f", ".publish"], cwd=repo, check=True,
                    capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "oops"], cwd=repo, check=True,
                    capture_output=True)
     (repo / "a.py").write_text("y\n")  # make a change so publish proceeds
-    r = run(["publish"], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0  # warning, not a failure
     assert ".publish/ is tracked by the source repo" in r.stderr
     assert "git rm -r --cached .publish" in r.stderr
@@ -111,6 +112,6 @@ def test_publish_no_tracked_warning_normally(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py"]})
     assert run(["init"], cwd=repo).code == 0
-    r = run(["publish"], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "is tracked by the source repo" not in r.stderr

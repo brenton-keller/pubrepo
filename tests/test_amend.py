@@ -1,4 +1,8 @@
-"""--amend + on_republish policy: T1-T27, T29, T30."""
+"""--amend + on_republish policy: T1-T27, T29, T30.
+
+Design §10 item 4: --amend asks for confirmation, or --yes off a
+terminal; every --amend run here is off a terminal and passes --yes.
+"""
 import json
 import os
 from pathlib import Path
@@ -8,6 +12,10 @@ import pytest
 import pubrepo
 from conftest import config_toml, git_run
 from test_divergence import _external_commit, _tree_bytes
+from ff_fixtures import push_argv
+
+# AC62: --amend is an explicit rewrite; the routine policy does not apply.
+pytestmark = pytest.mark.rewrite
 
 
 def _setup(source_repo, public_remote, run, files=None, **config_extra):
@@ -16,7 +24,7 @@ def _setup(source_repo, public_remote, run, files=None, **config_extra):
     config.update(config_extra)
     repo = source_repo(files or {"a.py": "v1\n"}, config)
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     return remote, repo
 
@@ -57,7 +65,7 @@ def test_amend_replaces_last_commit_same_parent(source_repo, public_remote, run,
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     post_sha = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
@@ -72,14 +80,14 @@ def test_amend_root_commit(source_repo, public_remote, run, published_tree):
     remote = public_remote()
     repo = source_repo({"a.py": "v1\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     pd = _publish_dir(repo)
     assert _remote_count(pd) == 1
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     assert _remote_count(pd) == 1
@@ -93,11 +101,11 @@ def test_amend_reuses_custom_title_regenerates_trailer(source_repo, public_remot
     remote, repo = _setup(source_repo, public_remote, run)
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    run(["-m", "My Custom Title"], cwd=repo)
+    run(["-m", "My Custom Title", "--yes"], cwd=repo)
 
     (repo / "a.py").write_text("v3\n")
     git_run("commit", "-aqm", "v3", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     pd = _publish_dir(repo)
@@ -107,6 +115,9 @@ def test_amend_reuses_custom_title_regenerates_trailer(source_repo, public_remot
     body = git_run("log", "-1", "--format=%B", cwd=str(pd)).strip()
     source_hash = git_run("rev-parse", "--short", "HEAD", cwd=repo).strip()
     assert f"Source: {source_hash}" in body
+    # Design §4.3 / §10 item 1: no Branch: line and no (dirty) marker.
+    assert "Branch:" not in body
+    assert "(dirty)" not in body
 
 
 # T4
@@ -118,7 +129,7 @@ def test_amend_reuses_default_title(source_repo, public_remote, run):
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     new_subject = git_run("log", "-1", "--format=%s", cwd=str(pd)).strip()
@@ -130,7 +141,7 @@ def test_amend_m_overrides_title(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run)
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend", "-m", "Brand New Title"], cwd=repo)
+    r = run(["--amend", "--yes", "-m", "Brand New Title"], cwd=repo)
     assert r.code == 0
 
     pd = _publish_dir(repo)
@@ -150,16 +161,19 @@ def test_amend_push_uses_lease_pinned_to_fetched_sha(source_repo, public_remote,
     real_git = pubrepo.git
     push_calls = []
 
-    def spying_git(*args, cwd=None, check=True):
-        if args and args[0] == "push":
+    # AC75 re-target: the branch push is `push --porcelain ... origin
+    # <sha>:refs/heads/main`, and git() now also takes env=. Assertions unchanged.
+    def spying_git(*args, cwd=None, check=True, **kwargs):
+        if push_argv(args) is not None:  # AC75 re-target: the porcelain push argv
             push_calls.append(args)
-        return real_git(*args, cwd=cwd, check=check)
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", spying_git)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
-    branch_pushes = [c for c in push_calls if "origin" in c and "main" in c]
+    branch_pushes = [c for c in push_calls
+                     if any(a.endswith(":refs/heads/main") for a in c)]  # AC75 re-target: the porcelain push argv
     assert len(branch_pushes) == 1
     assert any(f"--force-with-lease=refs/heads/main:{pre_sha}" in a
                for a in branch_pushes[0])
@@ -178,18 +192,19 @@ def test_amend_lease_race_refuses_and_restores_pre_amend(source_repo, public_rem
     real_git = pubrepo.git
     state = {"raced": False}
 
-    def racing_git(*args, cwd=None, check=True):
-        if (args and args[0] == "push"
+    def racing_git(*args, cwd=None, check=True, **kwargs):
+        if (push_argv(args) is not None  # AC75 re-target: the porcelain push argv
                 and any("force-with-lease" in a for a in args)
                 and not state["raced"]):
             state["raced"] = True
             _external_commit(remote, tmp_path, marker="second")
-        return real_git(*args, cwd=cwd, check=check)
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", racing_git)
-    r = run(["--amend"], cwd=repo)
-    assert r.code == 2
-    assert "push failed" in r.stderr.lower() or "stale" in r.stderr.lower()
+    r = run(["--amend", "--yes"], cwd=repo)
+    # Design §7 / §9 (§10 items 4 and 6): a rejected lease exits 5.
+    assert r.code == 5
+    assert "moved" in r.stderr.lower()
 
     assert "second.txt" in published_tree(remote)
     assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() == pre_sha
@@ -211,31 +226,38 @@ def test_amend_push_rejected_rolls_back_preserving_index_and_worktree(
 
     real_git = pubrepo.git
 
-    def failing_push_git(*args, cwd=None, check=True):
-        if args and args[0] == "push":
+    # AC75 re-target: the host refusal arrives as a `[remote rejected]`
+    # porcelain line. §10 item 4 / §6.5: nothing local moved (no commit to
+    # roll back, index and worktree as before), and the hint is to publish a
+    # new snapshot instead (--no-amend is a no-op since 1.1.0).
+    def failing_push_git(*args, cwd=None, check=True, **kwargs):
+        if push_argv(args) is not None:  # AC75 re-target: the porcelain push argv
             from types import SimpleNamespace
-            return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
-        return real_git(*args, cwd=cwd, check=check)
+            refspec = args[-1]
+            return SimpleNamespace(returncode=1, stderr="",
+                                   stdout=f"To x\n!\t{refspec}\t[remote rejected] "
+                                          f"(permission denied)\nDone\n")
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", failing_push_git)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 2
     assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() == pre_sha
 
     staged = git_run("diff", "--cached", "--name-only", cwd=str(pd)).strip()
-    assert "a.py" in staged
-
-    assert (pd / "a.py").read_text() == "v2\n"
-    assert "--no-amend" in r.stderr
+    assert staged == ""
+    assert (pd / "a.py").read_text() == "v1\n"
+    assert "host refused the push" in r.stderr
     assert "force-push permission" in r.stderr
 
 
 # T9
+# AC75: AC75 re-target: the push is `push --porcelain … origin` (push_argv) and git() takes env=; assertions unchanged
 def test_amend_root_push_failure_rollback(source_repo, public_remote, run, monkeypatch):
     remote = public_remote()
     repo = source_repo({"a.py": "v1\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
     pd = _publish_dir(repo)
     pre_sha = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
 
@@ -244,19 +266,20 @@ def test_amend_root_push_failure_rollback(source_repo, public_remote, run, monke
 
     real_git = pubrepo.git
 
-    def failing_push_git(*args, cwd=None, check=True):
-        if args and args[0] == "push":
+    def failing_push_git(*args, cwd=None, check=True, **kwargs):   # AC75 re-target: env=
+        if push_argv(args) is not None:  # AC75 re-target: the porcelain push argv
             from types import SimpleNamespace
             return SimpleNamespace(returncode=1, stdout="", stderr="denied")
-        return real_git(*args, cwd=cwd, check=check)
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", failing_push_git)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 2
     assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() == pre_sha
 
 
 # T10
+# AC75: AC75 re-target: the push is `push --porcelain … origin` (push_argv) and git() takes env=; assertions unchanged
 def test_amend_interrupt_during_push_restores_everything(source_repo, public_remote, run,
                                                           monkeypatch):
     remote, repo = _setup(source_repo, public_remote, run)
@@ -269,13 +292,13 @@ def test_amend_interrupt_during_push_restores_everything(source_repo, public_rem
 
     real_git = pubrepo.git
 
-    def interrupt_push_git(*args, cwd=None, check=True):
-        if args and args[0] == "push":
+    def interrupt_push_git(*args, cwd=None, check=True, **kwargs):   # AC75 re-target: env=
+        if push_argv(args) is not None:  # AC75 re-target: the porcelain push argv
             raise KeyboardInterrupt
-        return real_git(*args, cwd=cwd, check=check)
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", interrupt_push_git)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 130
     assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() == pre_sha
     assert _tree_bytes(pd) == pre_tree
@@ -288,7 +311,7 @@ def test_amend_unborn_head_refused(source_repo, public_remote, run):
     run(["init"], cwd=repo)
     pd = _publish_dir(repo)
 
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 2
     assert "no previous publish" in r.stderr
     assert not _log_entries(pd)
@@ -299,12 +322,12 @@ def test_amend_remote_branch_absent_refused(source_repo, public_remote, run, tmp
     remote, repo = _setup(source_repo, public_remote, run)
     pd = _publish_dir(repo)
 
-    # Point origin to a fresh empty bare repo (no branches at all)
-    new_remote = tmp_path / "empty_remote.git"
-    git_run("init", "--bare", "-q", "-b", "main", str(new_remote))
-    git_run("remote", "set-url", "origin", new_remote.as_uri(), cwd=str(pd))
+    # AC75 re-target (§10 item 20, §18.11 R5): R5 now refuses an origin
+    # other than [publish] remote before the fetch, so the branch is removed
+    # from the configured remote itself (was: set-url to an empty bare)
+    git_run("update-ref", "-d", "refs/heads/main", cwd=remote.removeprefix("file://"))
 
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 2
     assert "nothing on the remote" in r.stderr
 
@@ -319,13 +342,24 @@ def test_amend_local_ahead_refused(source_repo, public_remote, run):
             cwd=str(pd))
     git_run("commit", "--allow-empty", "-m", "local extra2\n\nSource: fake456\n",
             cwd=str(pd))
+    local_head = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
 
-    r = run(["--amend"], cwd=repo)
-    assert r.code == 2
-    assert "not on the remote" in r.stderr
+    # §10 item 4 (§4.10): local-only commits do not block --amend; the
+    # amend proceeds on the fetched tip and they are named and backed up.
+    (repo / "a.py").write_text("v2\n")
+    git_run("commit", "-aqm", "v2", cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
+    assert r.code == 0
+    assert "local extra2" in r.stderr
+    backups = git_run("for-each-ref", "--format=%(objectname)", "refs/pubrepo/local/",
+                      cwd=str(pd)).split()
+    assert backups == [local_head]
+    assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() != pre_sha
+    assert _remote_count(pd) == 1          # the root snapshot was replaced, not stacked
 
 
 # T14
+# AC75: §10 items 3 and 6 (no force hint, a foreign tip is 5, the hint says pull)
 def test_amend_diverged_refused_exit5_with_two_step_hint(source_repo, public_remote, run, tmp_path):
     remote, repo = _setup(source_repo, public_remote, run)
     _external_commit(remote, tmp_path)
@@ -333,10 +367,11 @@ def test_amend_diverged_refused_exit5_with_two_step_hint(source_repo, public_rem
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
 
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 5
-    assert "--force-overwrite" in r.stderr
-    assert "then --amend" in r.stderr
+    # the hint says pull; no force hint.
+    assert "run `pubrepo pull`" in r.stderr
+    assert "--force-overwrite" not in r.stderr
 
 
 # T15
@@ -360,9 +395,11 @@ def test_amend_merge_head_refused(source_repo, public_remote, run, tmp_path):
     shutil.rmtree(str(pd))
     run(["init"], cwd=repo)
 
-    r = run(["--amend"], cwd=repo)
-    assert r.code == 2
-    assert "merge" in r.stderr.lower()
+    r = run(["--amend", "--yes"], cwd=repo)
+    # §9, §10 items 6 and 4: a collaborator merge on top is an unpulled
+    # range (S2) → 5. The restore-ancestry merge case exits 2.
+    assert r.code == 5
+    assert "run `pubrepo pull`" in r.stderr
 
 
 # T16
@@ -385,9 +422,10 @@ def test_amend_foreign_head_no_log_refused(source_repo, public_remote, run, tmp_
     shutil.rmtree(str(pd))
     run(["init"], cwd=repo)
 
-    r = run(["--amend"], cwd=repo)
-    assert r.code == 2
-    assert "not a pubrepo snapshot" in r.stderr
+    r = run(["--amend", "--yes"], cwd=repo)
+    # §9, §10 items 6 and 4: a manual foreign commit on top is S2 → 5.
+    assert r.code == 5
+    assert "run `pubrepo pull`" in r.stderr
 
 
 # T17
@@ -399,9 +437,11 @@ def test_amend_log_mismatch_refused(source_repo, public_remote, run):
     pre_sha = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
     git_run("push", "--force", "origin", "main", cwd=str(pd))
 
-    r = run(["--amend"], cwd=repo)
-    assert r.code == 2
-    assert "publish log records" in r.stderr
+    r = run(["--amend", "--yes"], cwd=repo)
+    # §9, §10 items 6 and 4: our recorded snapshot is gone → S7 → 5.
+    assert r.code == 5
+    assert "no longer on public" in r.stderr
+    assert "publish log records" not in r.stderr
 
 
 # T18
@@ -415,12 +455,13 @@ def test_amend_fresh_init_clone_accepted(source_repo, public_remote, run, publis
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
     assert published_tree(remote) == {"a.py": b"v2\n"}
 
 
 # T19
+# AC75: AC75 re-target: the push is `push --porcelain … origin` (push_argv) and git() takes env=; assertions unchanged
 def test_amend_nothing_to_publish(source_repo, public_remote, run, monkeypatch):
     remote, repo = _setup(source_repo, public_remote, run)
     pd = _publish_dir(repo)
@@ -429,13 +470,13 @@ def test_amend_nothing_to_publish(source_repo, public_remote, run, monkeypatch):
     real_git = pubrepo.git
     push_calls = []
 
-    def spying_git(*args, cwd=None, check=True):
-        if args and args[0] == "push":
+    def spying_git(*args, cwd=None, check=True, **kwargs):   # AC75 re-target: env=
+        if push_argv(args) is not None:  # AC75 re-target: the porcelain push argv
             push_calls.append(args)
-        return real_git(*args, cwd=cwd, check=check)
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", spying_git)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Nothing to publish" in r.stdout
     assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() == pre_sha
@@ -452,7 +493,7 @@ def test_amend_message_only(source_repo, public_remote, run):
     pd = _publish_dir(repo)
     pre_sha = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
 
-    r = run(["--amend", "-m", "new title"], cwd=repo)
+    r = run(["--amend", "--yes", "-m", "new title"], cwd=repo)
     assert r.code == 0
 
     post_sha = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
@@ -475,7 +516,7 @@ def test_amend_m_equal_to_existing_title_is_noop(source_repo, public_remote, run
     existing_title = git_run("log", "-1", "--format=%s", cwd=str(pd)).strip()
     pre_sha = git_run("rev-parse", "HEAD", cwd=str(pd)).strip()
 
-    r = run(["--amend", "-m", existing_title], cwd=repo)
+    r = run(["--amend", "--yes", "-m", existing_title], cwd=repo)
     assert r.code == 0
     assert "Nothing to publish" in r.stdout
     assert git_run("rev-parse", "HEAD", cwd=str(pd)).strip() == pre_sha
@@ -488,12 +529,12 @@ def test_amend_chain_twice(source_repo, public_remote, run):
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     (repo / "a.py").write_text("v3\n")
     git_run("commit", "-aqm", "v3", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     count = _remote_count(pd)
@@ -501,7 +542,7 @@ def test_amend_chain_twice(source_repo, public_remote, run):
     # Actually _setup does init+publish → 1 commit on remote. Two amends → still 1.
     # Wait: _setup does one publish → remote has 1 commit. amend replaces it twice → 1.
     # But there was an init publish first. Let me re-check: _setup does init, then
-    # run([], cwd=repo) which does a normal publish. Remote has 1 commit.
+    # run(["publish", "--yes"], cwd=repo) which does a normal publish. Remote has 1 commit.
     # First amend replaces → 1. Second amend replaces → 1.
     assert count == 1
 
@@ -513,7 +554,7 @@ def test_amend_log_entry_fields(source_repo, public_remote, run):
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     entries = _log_entries(pd)
@@ -537,10 +578,14 @@ def test_amend_tags_source(source_repo, public_remote, run):
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
-    tags = git_run("tag", "-l", "published/*", cwd=repo).strip().splitlines()
+    # AC75 re-target (§10 item 20, §18.9 R2): the bookmark is the local ref
+    # refs/pubrepo/bookmarks/<ts>, never a published/* tag
+    assert git_run("tag", "-l", "published/*", cwd=repo).strip() == ""
+    tags = git_run("for-each-ref", "--format=%(refname)", "refs/pubrepo/bookmarks/",
+                   cwd=repo).strip().splitlines()
     assert len(tags) >= 1
 
     if "already exists, skipping" in r.stderr:
@@ -555,7 +600,7 @@ def test_amend_quiet_silent(source_repo, public_remote, run):
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--quiet", "--amend"], cwd=repo)
+    r = run(["--quiet", "--amend", "--yes"], cwd=repo)
     assert r.code == 0
     assert r.stdout == ""
 
@@ -593,46 +638,21 @@ def test_flag_conflicts(source_repo, public_remote, run, monkeypatch, flags, exp
 
 
 # T27
+@pytest.mark.no_git_calls  # AC63: refused at config load, before any git call
 def test_config_on_republish_amend(source_repo, public_remote, run, published_tree, tmp_path):
+    """§7, §10 item 3: on_republish = "amend" is retired. With it in
+    the config from the first publish, every publish is a config error
+    (exit 1) with the retirement message, and nothing is published."""
     remote = public_remote()
     config = {"remote": remote, "include": ["a.py"], "on_republish": "amend"}
     repo = source_repo({"a.py": "v1\n"}, config)
 
     run(["init"], cwd=repo)
-
-    # First publish: config amend but no prior commit → fallback to new_commit
-    r = run([], cwd=repo)
-    assert r.code == 0
-    pd = _publish_dir(repo)
-    assert _remote_count(pd) == 1
-    assert "no previous publish to amend" in r.stderr
-
-    # Second publish: amend (remote count stays 1)
-    (repo / "a.py").write_text("v2\n")
-    git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run([], cwd=repo)
-    assert r.code == 0
-    assert _remote_count(pd) == 1
-    assert published_tree(remote) == {"a.py": b"v2\n"}
-
-    # --no-amend appends (count goes to 2)
-    (repo / "a.py").write_text("v3\n")
-    git_run("commit", "-aqm", "v3", cwd=repo)
-    r = run(["--no-amend"], cwd=repo)
-    assert r.code == 0
-    assert _remote_count(pd) == 2
-
-    # --force-overwrite alone (no --no-amend) → ConfigError naming --no-amend
-    r = run(["--force-overwrite"], cwd=repo)
-    assert r.code == 1
-    assert "--no-amend" in r.stderr
-
-    # --no-amend --force-overwrite on a diverged remote → exit 0
-    _external_commit(remote, tmp_path)
-    (repo / "a.py").write_text("v4\n")
-    git_run("commit", "-aqm", "v4", cwd=repo)
-    r = run(["--no-amend", "--force-overwrite"], cwd=repo)
-    assert r.code == 0
+    for args in (["publish", "--yes"], ["--no-amend"], ["--amend", "--yes"]):
+        r = run(args, cwd=repo)
+        assert r.code == 1, args
+        assert "retired" in r.stderr and "on_republish" in r.stderr
+    assert published_tree(remote) == {}
 
 
 # T29
@@ -650,7 +670,7 @@ def test_amend_preserves_author_identity_refreshes_dates(source_repo, public_rem
 
     monkeypatch.setenv("GIT_AUTHOR_DATE", "2020-01-02T03:04:05+00:00")
     monkeypatch.setenv("GIT_COMMITTER_DATE", "2020-01-02T03:04:05+00:00")
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     monkeypatch.delenv("GIT_AUTHOR_DATE")
     monkeypatch.delenv("GIT_COMMITTER_DATE")
@@ -664,7 +684,7 @@ def test_amend_preserves_author_identity_refreshes_dates(source_repo, public_rem
 
     (repo / "a.py").write_text("v2\n")
     git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--amend"], cwd=repo)
+    r = run(["--amend", "--yes"], cwd=repo)
     assert r.code == 0
 
     fields = git_run("log", "-1", "--format=%an|%ae|%aI|%cn|%ce|%cI",
@@ -687,20 +707,18 @@ def test_amend_preserves_author_identity_refreshes_dates(source_repo, public_rem
 
 
 # T30
+@pytest.mark.no_git_calls  # AC63: refused at config load, before any git call
 def test_stage_ignores_on_republish(source_repo, public_remote, run):
+    # §7, §10 item 3: the retired key is refused at config load, for
+    # publish and --stage alike.
     remote = public_remote()
     config = {"remote": remote, "include": ["a.py"], "on_republish": "amend"}
     repo = source_repo({"a.py": "v1\n"}, config)
     run(["init"], cwd=repo)
-    run([], cwd=repo)
-
-    (repo / "a.py").write_text("v2\n")
-    git_run("commit", "-aqm", "v2", cwd=repo)
-    r = run(["--stage"], cwd=repo)
-    assert r.code == 0
-
-    pd = _publish_dir(repo)
-    assert _remote_count(pd) == 1  # no commit from stage
+    for args in (["publish", "--yes"], ["--stage"]):
+        r = run(args, cwd=repo)
+        assert r.code == 1, args
+        assert "retired" in r.stderr
 
 
 # Regression: git add -A failure must produce exit 2 (PublishError), not exit 1
@@ -712,16 +730,19 @@ def test_git_add_failure_exits_2(source_repo, public_remote, run, monkeypatch):
 
     real_git = pubrepo.git
 
-    def failing_add_git(*args, cwd=None, check=True):
-        if args and args[:2] == ("add", "-A") and ".publish" in str(cwd):
+    # AC75 re-target: the rework stages through a temporary index
+    # (read-tree/update-index/write-tree) instead of `git add -A`; the fault
+    # moves to write-tree. Behavioral assertions unchanged.
+    def failing_add_git(*args, cwd=None, check=True, **kwargs):
+        if args and args[:1] == ("write-tree",) and ".publish" in str(cwd):
             if check:
                 raise pubrepo.GitError(list(args), "fatal: unable to stat")
             from types import SimpleNamespace
             return SimpleNamespace(returncode=128, stdout="",
                                   stderr="fatal: unable to stat")
-        return real_git(*args, cwd=cwd, check=check)
+        return real_git(*args, cwd=cwd, check=check, **kwargs)
 
     monkeypatch.setattr(pubrepo, "git", failing_add_git)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 2
     assert "staging failed" in r.stderr

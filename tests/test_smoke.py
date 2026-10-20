@@ -15,7 +15,7 @@ def test_publish_roundtrip(source_repo, public_remote, run, published_tree):
     r = run(["init"], cwd=repo)
     assert r.code == 0
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
 
     assert published_tree(remote) == {
@@ -28,9 +28,9 @@ def test_second_publish_nothing(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "x = 1\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Nothing to publish" in r.stdout

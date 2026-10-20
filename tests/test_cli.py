@@ -1,5 +1,6 @@
 """T13 (ui: --quiet/--verbose/color) + T14 (subparsers, --version, exit codes)."""
 import json
+import pytest
 
 import pubrepo
 
@@ -16,7 +17,7 @@ def _repo(source_repo, public_remote, **config_extra):
 def test_quiet_success_produces_empty_stdout(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     assert run(["init", "-q"], cwd=repo).stdout == ""
-    r = run(["publish", "-q"], cwd=repo)
+    r = run(["publish", "-q", "--yes"], cwd=repo)
     assert r.code == 0
     assert r.stdout == ""
     assert "Published" not in r.stderr  # success is silent, not rerouted
@@ -42,7 +43,7 @@ def test_verbose_emits_exclude_details_and_timing(source_repo, public_remote, ru
         {"remote": remote, "include": ["."], "scrub": {"forbidden": ["sekrit"]}},
     )
     run(["init"], cwd=repo)
-    r = run(["publish", "-v"], cwd=repo)
+    r = run(["publish", "-v", "--yes"], cwd=repo)
     assert r.code == 0
     assert "exclude: junk.pyc (pattern: *.pyc)" in r.stderr
     assert "timing: rebuild" in r.stderr
@@ -79,18 +80,21 @@ def test_default_command_shim_equivalence(source_repo, public_remote, run):
     assert bare.stdout == explicit.stdout
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_version_exits_zero(source_repo, public_remote, run, tmp_path, capsys):
     # --version short-circuits before config load; any cwd works.
     r = run(["--version"], cwd=tmp_path)
     assert r.code == 0
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_unknown_command_exits_one(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     r = run(["bogus"], cwd=repo)
     assert r.code == 1
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_dry_run_flag_on_wrong_command_exits_one(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     r = run(["init", "--dry-run"], cwd=repo)  # argparse: unrecognized argument
@@ -113,6 +117,7 @@ def test_dry_run_exits_4_on_scrub_failure(source_repo, public_remote, run):
     assert json.loads(r.stdout)["scrub"]["passed"] is False
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_publish_json_without_dry_run_exits_one(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     r = run(["publish", "--json"], cwd=repo)
@@ -120,6 +125,9 @@ def test_publish_json_without_dry_run_exits_one(source_repo, public_remote, run)
     assert "--json only applies" in r.stderr
 
 
+# §10 item 19: the missing-include check reads local pull
+# records (read-only git calls), so this is no longer zero-call; no_git_calls
+# removed under §10 item 19.
 def test_validate_happy_and_missing_include(source_repo, public_remote, run):
     repo = _repo(source_repo, public_remote)
     r = run(["validate"], cwd=repo)
@@ -134,6 +142,7 @@ def test_validate_happy_and_missing_include(source_repo, public_remote, run):
 
 # --- P0: prog-name in hint messages (same file, two names) ---------------------
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_hints_name_pubrepo_by_default(run, monkeypatch, tmp_path):
     # Console-script users must never be told to run the internal alias.
     monkeypatch.setattr(pubrepo.sys, "argv", ["pubrepo", "status"])
@@ -143,6 +152,7 @@ def test_hints_name_pubrepo_by_default(run, monkeypatch, tmp_path):
     assert "git-sync-publish" not in r.stdout + r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_hints_follow_internal_alias(run, monkeypatch, tmp_path):
     monkeypatch.setattr(pubrepo.sys, "argv",
                         ["/home/x/.local/bin/git-sync-publish", "status"])
@@ -151,6 +161,7 @@ def test_hints_follow_internal_alias(run, monkeypatch, tmp_path):
     assert "Then: git-sync-publish init" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_unknown_argv0_falls_back_to_pubrepo(run, monkeypatch, tmp_path):
     monkeypatch.setattr(pubrepo.sys, "argv", ["/usr/bin/pytest", "status"])
     r = run(["status"], cwd=tmp_path)
@@ -158,6 +169,7 @@ def test_unknown_argv0_falls_back_to_pubrepo(run, monkeypatch, tmp_path):
     assert "Then: pubrepo init" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_not_initialized_hint_uses_prog(source_repo, public_remote, run, monkeypatch):
     repo = _repo(source_repo, public_remote)  # no init
     monkeypatch.setattr(pubrepo.sys, "argv", ["pubrepo", "status"])

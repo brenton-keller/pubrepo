@@ -66,7 +66,7 @@ def test_nested_internal_dir_excluded_everywhere(source_repo, public_remote, run
         {"remote": remote, "include": ["."], "exclude": ["internal/"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     paths = set(published_tree(remote))
     assert "src/ok.py" in paths
@@ -80,7 +80,7 @@ def test_anchored_exclude_only_matches_anchored(source_repo, public_remote, run,
         {"remote": remote, "include": ["."], "exclude": ["src/gen/*.py"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     paths = set(published_tree(remote))
     assert "other/gen/a.py" in paths
@@ -94,7 +94,7 @@ def test_dirs_only_spares_file_of_same_name(source_repo, public_remote, run, pub
         {"remote": remote, "include": ["."], "exclude": ["internal/"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "internal" in published_tree(remote)
 
@@ -107,7 +107,7 @@ def test_exclude_beats_direct_include_with_warning(source_repo, public_remote, r
         {"remote": remote, "include": ["a.py", "b.py"], "exclude": ["a.py"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "exclude wins" in r.stderr
     assert set(published_tree(remote)) == {"b.py"}
@@ -120,7 +120,7 @@ def test_excluded_dir_dominates_include_below_it(source_repo, public_remote, run
         {"remote": remote, "include": ["a.py", "internal/notes.txt"], "exclude": ["internal/"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "exclude wins" in r.stderr
     assert set(published_tree(remote)) == {"a.py"}
@@ -141,7 +141,7 @@ def test_explicit_include_beats_defaults_at_entry_but_not_contents(
         {"remote": remote, "include": ["a.py", "__pycache__/"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     tree = published_tree(remote)
     assert "__pycache__/readme.txt" in tree   # entry-level include honored
@@ -157,7 +157,7 @@ def test_collision_skip_keeps_status_parity(source_repo, public_remote, run):
         {"remote": remote, "include": ["a.py", "b.py"], "exclude": ["a.py"]},
     )
     run(["init"], cwd=repo)
-    run([], cwd=repo)
-    r = run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "Nothing to publish" in r.stdout

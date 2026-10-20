@@ -5,6 +5,7 @@ _count_changes -z parsing, keep/transform validation, and JSON schema fields.
 Complements test_stage_blackbox.py (blind contract tests).
 """
 import fcntl
+import pytest
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ def _setup(source_repo, public_remote, run, files=None, config_extra=None):
     config.update(config_extra or {})
     repo = source_repo(files or {"a.py": "x\n"}, config)
     run(["init"], cwd=repo)
-    run([], cwd=repo)  # initial publish
+    run(["publish", "--yes"], cwd=repo)  # initial publish
     return remote, repo
 
 
@@ -208,7 +209,9 @@ def test_json_success_with_changes(source_repo, public_remote, run):
     assert data["staged"] is True
     assert data["changed"] is True
     assert isinstance(data["baseline"]["sha"], str) and len(data["baseline"]["sha"]) > 0
-    assert data["baseline"]["ref"] == "HEAD"
+    # Design §4.5, §10 item 15: the baseline is the git-tree baseline (the
+    # tip, or the IP when tip != IP), not the .publish/ worktree's HEAD.
+    assert data["baseline"]["ref"] == "tip"
     assert data["remote_checked"] is False
     assert isinstance(data["changes"]["added"], int)
     assert isinstance(data["changes"]["modified"], int)
@@ -335,13 +338,15 @@ def test_interrupt_mid_copy(source_repo, public_remote, run, monkeypatch):
     git_run("add", "-A", cwd=repo)
     git_run("commit", "-m", "mod", cwd=repo)
 
-    real_copy = pubrepo.copy_includes
+    # AC75 re-target: copy_includes → _build_projection (the preview's
+    # projection). Behavioral assertions unchanged.
+    real_projection = pubrepo._build_projection
 
     def interrupting_copy(*args, **kwargs):
-        real_copy(*args, **kwargs)
+        real_projection(*args, **kwargs)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(pubrepo, "copy_includes", interrupting_copy)
+    monkeypatch.setattr(pubrepo, "_build_projection", interrupting_copy)
     r = run(["--stage"], cwd=repo)
     assert r.code == 130
 
@@ -401,7 +406,7 @@ def test_multi_target(source_repo, public_remote, run, tmp_path):
     repo = source_repo({"a.py": "x\n"},
                        {"remote": remote1, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
 
     alt_config = config_toml({"remote": remote2, "include": ["a.py"],
                               "dir": ".publish-alt", "branch": "main"})
@@ -480,6 +485,7 @@ def test_unborn_head_first_stage(source_repo, public_remote, run):
 # Test 15: Keep/transform overlap validation
 # ===========================================================================
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_keep_transform_exact_overlap(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo(
@@ -493,6 +499,7 @@ def test_keep_transform_exact_overlap(source_repo, public_remote, run):
     assert "compound" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_keep_transform_nested_overlap(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo(
@@ -506,6 +513,7 @@ def test_keep_transform_nested_overlap(source_repo, public_remote, run):
     assert "compound" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_keep_transform_normalized_overlap(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo(
@@ -519,6 +527,7 @@ def test_keep_transform_normalized_overlap(source_repo, public_remote, run):
     assert "compound" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_keep_transform_non_overlap_passes(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo(
@@ -531,8 +540,9 @@ def test_keep_transform_non_overlap_passes(source_repo, public_remote, run):
     assert r.code == 0
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_keep_transform_dotdot_bypass_blocked(source_repo, public_remote, run):
-    """Critic BLOCKER 1: x/../docs/LICENSE must be caught."""
+    """x/../docs/LICENSE must be caught."""
     remote = public_remote()
     repo = source_repo(
         {"a.py": "x\n", "docs/LICENSE": "MIT\n", "x/dummy": "d\n"},
@@ -545,8 +555,9 @@ def test_keep_transform_dotdot_bypass_blocked(source_repo, public_remote, run):
     assert "compound" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_absolute_transform_path_rejected(source_repo, public_remote, run):
-    """Audit F-02: absolute transform paths must be rejected at validation."""
+    """Absolute transform paths must be rejected at validation."""
     remote = public_remote()
     repo = source_repo(
         {"a.py": "x\n"},
@@ -558,8 +569,9 @@ def test_absolute_transform_path_rejected(source_repo, public_remote, run):
     assert "absolute path" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_dotdot_escape_transform_path_rejected(source_repo, public_remote, run):
-    """Audit F-02: ../escaped transform paths must be rejected at validation."""
+    """../escaped transform paths must be rejected at validation."""
     remote = public_remote()
     repo = source_repo(
         {"a.py": "x\n"},
@@ -587,7 +599,7 @@ def test_stage_then_publish_byte_identical(source_repo, public_remote, run, publ
     assert r.code == 0
     stage_hashes = _tree_hash(repo / ".publish")
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
 
     tree = published_tree(remote)
@@ -611,9 +623,11 @@ def test_git_fault_injection(source_repo, public_remote, run, monkeypatch):
 
     real_git = pubrepo.git
 
+    # AC75 re-target: the stage diff step no longer exists; the fault moves to
+    # the temporary index's read-tree. Behavioral assertions unchanged.
     def failing_git(*args, **kwargs):
         if kwargs.get("env") and "GIT_INDEX_FILE" in kwargs["env"]:
-            if args and args[0] == "diff":
+            if args and args[0] == "read-tree":
                 result = type(real_git("--version"))
                 result.returncode = 128
                 result.stdout = ""
@@ -644,7 +658,7 @@ def test_special_filenames(source_repo, public_remote, run):
         {"remote": remote, "include": ["."]},
     )
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
 
     (repo / "hello world.py").write_text("space\n")
     (repo / "café.txt").write_text("unicode\n")
@@ -668,7 +682,8 @@ def test_unreachable_remote_succeeds(source_repo, public_remote, run):
     remote, repo = _setup(source_repo, public_remote, run)
 
     pub = repo / ".publish"
-    git_run("remote", "set-url", "origin", "ssh://nonexistent.invalid/repo.git", cwd=pub)
+    # §17.4 sandbox: the unreachable remote is a missing file:// path inside the base.
+    git_run("remote", "set-url", "origin", (repo.parent / "nonexistent.git").as_uri(), cwd=pub)
 
     (repo / "a.py").write_text("changed\n")
     git_run("add", "-A", cwd=repo)
@@ -677,7 +692,7 @@ def test_unreachable_remote_succeeds(source_repo, public_remote, run):
     r = run(["--stage"], cwd=repo)
     assert r.code == 0
 
-    r2 = run([], cwd=repo)
+    r2 = run(["publish", "--yes"], cwd=repo)
     assert r2.code == 2
 
 
@@ -691,7 +706,7 @@ def test_lock_isolation(source_repo, public_remote, run):
     repo = source_repo({"a.py": "x\n"},
                        {"remote": remote1, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    run([], cwd=repo)
+    run(["publish", "--yes"], cwd=repo)
 
     alt_config = config_toml({"remote": remote2, "include": ["a.py"],
                               "dir": ".publish-alt", "branch": "main"})
@@ -699,7 +714,7 @@ def test_lock_isolation(source_repo, public_remote, run):
     git_run("add", ".publish-alt.toml", cwd=repo)
     git_run("commit", "-m", "alt config", cwd=repo)
     run(["init", "--config", ".publish-alt.toml"], cwd=repo)
-    run(["publish", "--config", ".publish-alt.toml"], cwd=repo)
+    run(["publish", "--config", ".publish-alt.toml", "--yes"], cwd=repo)
 
     lock_path = repo / ".publish" / ".git" / "pubrepo.lock"
     with open(lock_path, "w") as holder:
@@ -721,7 +736,7 @@ def test_lock_isolation(source_repo, public_remote, run):
 
 
 # ===========================================================================
-# Test 21: Interrupt during temp-index (Critic MINOR 5 correction)
+# Test 21: Interrupt during temp-index
 # ===========================================================================
 
 def test_interrupt_during_temp_index(source_repo, public_remote, run, monkeypatch):
@@ -741,7 +756,10 @@ def test_interrupt_during_temp_index(source_repo, public_remote, run, monkeypatc
     def interrupting_git(*args, **kwargs):
         nonlocal interrupted
         env = kwargs.get("env")
-        if env and "GIT_INDEX_FILE" in env and args and args[0] == "add" and not interrupted:
+        # AC75 re-target: `add` → the materializing checkout-index; the temp
+        # file pattern is pubrepo-idx-*. Behavioral assertions unchanged.
+        if env and "GIT_INDEX_FILE" in env and args and args[0] == "checkout-index" \
+                and not interrupted:
             interrupted = True
             raise KeyboardInterrupt
         return real_git(*args, **kwargs)
@@ -751,7 +769,7 @@ def test_interrupt_during_temp_index(source_repo, public_remote, run, monkeypatc
     assert r.code == 130
 
     import glob
-    stage_files = glob.glob(str(pub / ".git" / "stage-idx-*"))
+    stage_files = glob.glob(str(pub / ".git" / f"{pubrepo.TEMP_INDEX_PREFIX}*"))
     assert stage_files == [], f"Temp index files left behind: {stage_files}"
 
     lock_path = pub / ".git" / "pubrepo.lock"
@@ -778,7 +796,7 @@ def test_source_dirty_with_untracked_included_file(source_repo, public_remote, r
 
 
 # ===========================================================================
-# Critic MAJOR 3: Cleanup failure raises PublishError
+# Cleanup failure raises PublishError
 # ===========================================================================
 
 def test_cleanup_failure_raises_error(source_repo, public_remote, run, monkeypatch):
@@ -790,8 +808,9 @@ def test_cleanup_failure_raises_error(source_repo, public_remote, run, monkeypat
 
     real_unlink = os.unlink
 
+    # AC75 re-target: stage-idx-* → the C2/C3 temporary index pattern.
     def failing_unlink(path):
-        if "stage-idx-" in str(path) and not str(path).endswith(".lock"):
+        if pubrepo.TEMP_INDEX_PREFIX in str(path) and not str(path).endswith(".lock"):
             raise PermissionError("injected")
         real_unlink(path)
 
@@ -810,8 +829,9 @@ def test_cleanup_failure_no_json_success(source_repo, public_remote, run, monkey
 
     real_unlink = os.unlink
 
+    # AC75 re-target: stage-idx-* → the C2/C3 temporary index pattern.
     def failing_unlink(path):
-        if "stage-idx-" in str(path) and not str(path).endswith(".lock"):
+        if pubrepo.TEMP_INDEX_PREFIX in str(path) and not str(path).endswith(".lock"):
             raise PermissionError("injected")
         real_unlink(path)
 
@@ -822,7 +842,7 @@ def test_cleanup_failure_no_json_success(source_repo, public_remote, run, monkey
 
 
 # ===========================================================================
-# Critic MAJOR 4: Transform write failure → PublishError (exit 2)
+# Transform write failure → PublishError (exit 2)
 # ===========================================================================
 
 def test_transform_write_failure_stage(source_repo, public_remote, run, monkeypatch):
@@ -837,16 +857,16 @@ def test_transform_write_failure_stage(source_repo, public_remote, run, monkeypa
     git_run("add", "-A", cwd=repo)
     git_run("commit", "-m", "mod", cwd=repo)
 
-    real_write_text = Path.write_text
+    # AC75 re-target: transformed content is written as a blob to .publish's
+    # ODB (_hash_bytes without a path), not into .publish/. Assertions unchanged.
+    real_hash_bytes = pubrepo._hash_bytes
 
-    def failing_write_text(self, *args, **kwargs):
-        pub = repo / ".publish"
-        if pub in self.parents or self.parent == pub:
-            if self.name == "a.py":
-                raise OSError("injected write failure")
-        return real_write_text(self, *args, **kwargs)
+    def failing_hash_bytes(*args, **kwargs):
+        if kwargs.get("write") and kwargs.get("path") is None:
+            raise OSError("injected write failure")
+        return real_hash_bytes(*args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_text", failing_write_text)
+    monkeypatch.setattr(pubrepo, "_hash_bytes", failing_hash_bytes)
 
     r = run(["--stage"], cwd=repo)
     assert r.code == 2
@@ -869,18 +889,19 @@ def test_transform_write_failure_full_publish(source_repo, public_remote, run, m
     git_run("add", "-A", cwd=repo)
     git_run("commit", "-m", "mod", cwd=repo)
 
-    real_write_text = Path.write_text
+    # AC75 re-target: transformed content is no longer written into
+    # .publish/; it is written as a blob to .publish's ODB (_hash_bytes
+    # without a path). The fault moves there. Behavioral assertions unchanged.
+    real_hash_bytes = pubrepo._hash_bytes
 
-    def failing_write_text(self, *args, **kwargs):
-        pub = repo / ".publish"
-        if pub in self.parents or self.parent == pub:
-            if self.name == "a.py":
-                raise OSError("injected write failure")
-        return real_write_text(self, *args, **kwargs)
+    def failing_hash_bytes(*args, **kwargs):
+        if kwargs.get("write") and kwargs.get("path") is None:
+            raise OSError("injected write failure")
+        return real_hash_bytes(*args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_text", failing_write_text)
+    monkeypatch.setattr(pubrepo, "_hash_bytes", failing_hash_bytes)
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 2
     assert "cannot write transformed file" in r.stderr
 
@@ -907,7 +928,7 @@ def test_scrub_failure_no_log_during_stage(source_repo, public_remote, run):
     assert r.code == 4
     assert _log_bytes(repo) == log_before
 
-    r2 = run([], cwd=repo)
+    r2 = run(["publish", "--yes"], cwd=repo)
     assert r2.code == 4
     assert _log_bytes(repo) != log_before
 

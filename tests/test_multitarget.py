@@ -1,4 +1,6 @@
 """T23: --config flag + dir key — multi-target isolation by construction."""
+import pytest
+
 from conftest import config_toml
 
 
@@ -24,8 +26,8 @@ def test_two_targets_full_isolation(source_repo, public_remote, run, published_t
     assert run(["init", "--config", ".publish-sdk.toml"], cwd=repo).code == 0
     assert (repo / ".publish-sdk" / ".git").exists()
 
-    assert run([], cwd=repo).code == 0
-    assert run(["publish", "--config", ".publish-sdk.toml"], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
+    assert run(["publish", "--config", ".publish-sdk.toml", "--yes"], cwd=repo).code == 0
 
     main_tree = published_tree(remote_main)
     sdk_tree = published_tree(remote_sdk)
@@ -50,8 +52,8 @@ def test_root_include_two_targets_no_cross_leak(source_repo, public_remote, run,
     run(["init"], cwd=repo)
     run(["init", "--config", ".publish-b.toml"], cwd=repo)
 
-    assert run([], cwd=repo).code == 0
-    assert run(["publish", "--config", ".publish-b.toml"], cwd=repo).code == 0
+    assert run(["publish", "--yes"], cwd=repo).code == 0
+    assert run(["publish", "--config", ".publish-b.toml", "--yes"], cwd=repo).code == 0
 
     for remote in (remote_a, remote_b):
         tree = published_tree(remote)
@@ -59,6 +61,7 @@ def test_root_include_two_targets_no_cross_leak(source_repo, public_remote, run,
         assert not any(p.startswith(".publish") for p in tree)
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_in_tree_config_bad_name_rejected(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py"]})
@@ -76,7 +79,7 @@ def test_out_of_tree_config_any_name_allowed(source_repo, public_remote, run, tm
     external.write_text((repo / ".publish.toml").read_text())
 
     assert run(["init", "--config", str(external)], cwd=repo).code == 0
-    assert run(["publish", "--config", str(external)], cwd=repo).code == 0
+    assert run(["publish", "--config", str(external), "--yes"], cwd=repo).code == 0
     assert "a.py" in published_tree(remote)
 
 

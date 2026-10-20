@@ -14,23 +14,28 @@ from conftest import git_run
 
 
 def _tags(repo):
-    out = git_run("tag", "-l", "published/*", cwd=repo)
-    return [line for line in out.splitlines() if line]
+    """The source bookmarks. AC75 re-target (§10 item 20, §18.9 R2): a clean
+    publish records refs/pubrepo/bookmarks/<ts>, never a published/* tag."""
+    assert git_run("tag", "-l", "published/*", cwd=repo).strip() == ""
+    out = git_run("for-each-ref", "--format=%(refname)", "refs/pubrepo/bookmarks/", cwd=repo)
+    return [line.removeprefix("refs/pubrepo/bookmarks/") for line in out.splitlines() if line]
 
 
-# --- T1: source tagging (H1) -------------------------------------------------
+# --- T1: source tagging -------------------------------------------------
 
 def test_clean_publish_tags_source_and_origin(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
 
+    # AC75 re-target (§10 item 20, §18.3, §18.9 R2): the bookmark stays
+    # local without a tag_remote (was: a published/<ts> tag pushed to origin)
     tags = _tags(repo)
     assert len(tags) == 1
-    assert re.fullmatch(r"published/\d{8}T\d{6}", tags[0])
-    assert tags[0] in git_run("ls-remote", "--tags", "origin", cwd=repo)
+    assert re.fullmatch(r"\d{8}T\d{6}", tags[0])
+    assert tags[0] not in git_run("ls-remote", "origin", cwd=repo)
 
 
 def test_dirty_publish_does_not_tag(source_repo, public_remote, run):
@@ -38,7 +43,7 @@ def test_dirty_publish_does_not_tag(source_repo, public_remote, run):
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": ["a.py"]})
     run(["init"], cwd=repo)
     (repo / "a.py").write_text("y\n")  # tracked modification => dirty
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "(dirty)" in r.stdout
     assert _tags(repo) == []
@@ -58,19 +63,19 @@ def test_same_second_tag_collision_skips(source_repo, public_remote, run, monkey
 
     monkeypatch.setattr(pubrepo, "datetime", FixedDatetime)
 
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert len(_tags(repo)) == 1
 
     (repo / "a.py").write_text("y\n")
     git_run("commit", "-aqm", "change", cwd=repo)  # stay clean => tag path runs
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "already exists, skipping" in r.stderr  # info => stderr since T13
     assert len(_tags(repo)) == 1
 
 
-# --- T2: hard-excludes (H2) --------------------------------------------------
+# --- T2: hard-excludes --------------------------------------------------
 
 def test_root_include_ships_no_private_files(source_repo, public_remote, run, published_tree):
     remote = public_remote()
@@ -79,9 +84,9 @@ def test_root_include_ships_no_private_files(source_repo, public_remote, run, pu
         {"remote": remote, "include": ["."]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
-    assert "repository root" in r.stderr  # warn, don't block
+    assert "is the source root" in r.stderr  # warn, don't block
 
     paths = set(published_tree(remote))
     assert "a.py" in paths and "docs/d.md" in paths
@@ -109,7 +114,7 @@ def test_nested_repo_warns_and_strips_git(source_repo, public_remote, run, publi
     )
     git_run("init", "-q", "-b", "main", cwd=repo / "vendored/lib")  # nested repo
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert "nested git repo at 'vendored/lib'" in r.stderr
 
@@ -118,6 +123,7 @@ def test_nested_repo_warns_and_strips_git(source_repo, public_remote, run, publi
     assert not any(".git" in Path(p).parts for p in tree)
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_git_include_rejected(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": [".git"]})
@@ -126,6 +132,7 @@ def test_git_include_rejected(source_repo, public_remote, run):
     assert "can never be published" in r.stderr
 
 
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_config_include_rejected(source_repo, public_remote, run):
     remote = public_remote()
     repo = source_repo({"a.py": "x\n"}, {"remote": remote, "include": [".publish.toml"]})
@@ -148,7 +155,7 @@ def test_publish_namespace_is_not_greedy(source_repo, public_remote, run, publis
         {"remote": remote, "include": ["."]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     tree = published_tree(remote)
     assert ".published-artifacts/out.txt" in tree
@@ -175,7 +182,7 @@ def test_env_rules(source_repo, public_remote, run, published_tree, name, publis
         {"remote": remote, "include": ["."]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     assert (name in published_tree(remote)) is published
 
@@ -187,7 +194,7 @@ def test_user_exclude_beats_env_allowlist(source_repo, public_remote, run, publi
         {"remote": remote, "include": ["."], "exclude": [".env.example"]},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 0
     tree = published_tree(remote)
     assert ".env.example" not in tree
@@ -208,6 +215,7 @@ def test_user_exclude_beats_env_allowlist(source_repo, public_remote, run, publi
     ({"find": "a", "replace": "b", "strip_between": ["x", "y"]}, "use one per rule"),
     ({"other": "x"}, "must have 'find'+'replace' or 'strip_between'"),
 ])
+@pytest.mark.no_git_calls  # AC63: refused before any git call
 def test_transform_validation(source_repo, public_remote, run, rule, phrase):
     remote = public_remote()
     repo = source_repo(
@@ -260,7 +268,7 @@ def test_scrub_blocks_publish_exit_4(source_repo, public_remote, run, published_
         {"remote": remote, "include": ["a.py"], "scrub": {"forbidden": ["sekrit"]}},
     )
     run(["init"], cwd=repo)
-    r = run([], cwd=repo)
+    r = run(["publish", "--yes"], cwd=repo)
     assert r.code == 4
     assert "SCRUB FAILED" in r.stderr
     assert published_tree(remote) == {}  # nothing reached the world
